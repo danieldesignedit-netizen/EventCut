@@ -1,0 +1,7 @@
+numpy>=1.26
+scipy>=1.11
+opencv-python-headless>=4.10
+pillow>=10
+pystray>=0.19
+faster-whisper>=1.0
+pyinstaller>=6.6
