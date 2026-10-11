@@ -19,7 +19,7 @@ import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from . import analyze, audio, grade, media, render, smart, story
 from .config import HOME, PORT, VERSION, ensure_folders, load_settings, save_settings
@@ -78,6 +78,13 @@ def verify_access(token):
     _auth_cache[h] = (time.time() + 600, user)  # re-check every 10 minutes so revoking takes effect quickly
     (HOME / "Projects" / "_access.json").write_text(json.dumps({"sub": claims.get("sub"), "user": user, "until": time.time() + 3 * 86400}))
     return user
+
+
+def safe_name(name: str, fallback: str) -> str:
+    """Keep a readable file name (letters in any language) without path tricks."""
+    name = os.path.basename(str(name).replace("\\", "/"))
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "", name).strip(" .")
+    return name[:120] or fallback
 
 
 def path_allowed(p: str) -> bool:
@@ -185,6 +192,40 @@ def project_dir(name):
     return d
 
 
+def feed_copy(src):
+    """Small web copy of a finished video for the homepage feed: 720 px on the long side, at most 30 s, about 2 MB."""
+    if not src or not path_allowed(src) or not os.path.isfile(src):
+        raise ValueError("Video not found")
+    ff, _ = media.tools()
+    folder = HOME / "Projects" / "_feed"
+    folder.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha1(f"{src}|{os.path.getmtime(src)}".encode()).hexdigest()[:16]
+    vid, img = folder / f"{key}.mp4", folder / f"{key}.jpg"
+    info = media.probe(src)
+    dur = min(30.0, float(info.get("duration") or 30))
+    w, h = info.get("width") or 1080, info.get("height") or 1920
+    scale = "scale=-2:720" if h >= w else "scale=720:-2"
+    if not vid.exists():
+        media.run([ff, "-y", "-v", "error", "-i", src, "-t", f"{dur:.2f}", "-vf", f"{scale},fps=25,format=yuv420p",
+                   "-c:v", "libx264", "-preset", "medium", "-crf", "30", "-maxrate", "700k", "-bufsize", "1400k",
+                   "-c:a", "aac", "-b:a", "80k", "-ac", "2", "-movflags", "+faststart",
+                   "-af", f"afade=t=out:st={max(0, dur - 0.6):.2f}:d=0.6", str(vid)])
+    if not img.exists():
+        thumb = Path(src[:-4] + "_thumbnail.jpg")
+        media.run([ff, "-y", "-v", "error"] + (["-i", str(thumb)] if thumb.exists() else ["-ss", f"{min(1.5, dur / 3):.2f}", "-i", src])
+                  + ["-frames:v", "1", "-vf", scale, "-q:v", "5", str(img)])
+    return {"video": str(vid), "poster": str(img), "seconds": round(dur, 1), "width": w, "height": h,
+            "bytes": vid.stat().st_size}
+
+
+def export_name(event, fmt, version_dir):
+    """EventCut_Team-Bonding_9x16_v3_2026-10-11: sorts by event, then shape, version and date."""
+    words = re.sub(r"[^A-Za-z0-9 -]+", " ", event or "Event").split()
+    ev = "-".join(w[:1].upper() + w[1:] for w in words)[:40] or "Event"
+    v = str(version_dir.name).split(" ")[-1]
+    return f"EventCut_{ev}_{fmt.replace(':', 'x')}_v{v}_{time.strftime('%Y-%m-%d')}"
+
+
 def run_generate(job: Job):
     p = job.payload
     s = dict(p.get("settings") or {})
@@ -268,7 +309,7 @@ def run_generate(job: Job):
         out_dir = project_dir(s.get("name") or s.get("event_type") or "Event")
         results = []
         for f in formats:
-            fs = dict(s, format=f, name=f"{s.get('name') or 'EventCut'} {f.replace(':', 'x')}")
+            fs = dict(s, format=f, name=export_name(s.get("name") or s.get("event_type") or "Event", f, out_dir))
             fdir = out_dir / f.replace(":", "x")
             t0 = time.time()
             job.set_stage(f"render_{f}", f"Rendering {f}")
@@ -410,7 +451,7 @@ class Handler(BaseHTTPRequestHandler):
         if origin and self.origin_ok():
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
-            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Filename")
+            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Filename, X-Folder")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Private-Network", "true")
             self.send_header("Access-Control-Max-Age", "600")
@@ -535,24 +576,35 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/grade-preview" and method == "POST":
             return self.grade_preview(self.body())
         if path == "/library/search":
+            qq, cat, pg = q.get("q", [""])[0], q.get("category", ["music"])[0], int(q.get("page", ["1"])[0])
+            originals = audio.originals_for(qq) if cat == "music" and pg == 1 else []
             try:
-                return self.send_json(audio.search_online(q.get("q", [""])[0], q.get("category", ["music"])[0], int(q.get("page", ["1"])[0])))
+                res = audio.search_online(qq, cat, pg)
+                res["originals"] = originals
+                return self.send_json(res)
             except Exception:
-                return self.send_json({"error": "The online library can't be reached. Check your internet connection.", "results": []}, 502)
+                return self.send_json({"error": "The online library can't be reached. Check your internet connection.", "results": [],
+                                       "originals": originals, "pages": 1}, 200 if originals else 502)
         if path == "/library/add" and method == "POST":
             b = self.body()
             return self.send_json({"path": audio.download_online(b["item"], b.get("category", "music"))})
         if path == "/library":
             return self.send_json(audio.ensure_library())
         if path == "/library/upload" and method == "POST":
-            name = re.sub(r"[^A-Za-z0-9 ._()-]+", "", self.headers.get("X-Filename", "upload.mp3"))
+            name = safe_name(unquote(self.headers.get("X-Filename", "upload.mp3")), "upload.mp3")
             folder = self.headers.get("X-Folder", "Uploads")
             dest_dir = {"Uploads": audio.LIB / "Uploads", "Logos": HOME / "Assets" / "Logos", "Fonts": HOME / "Assets" / "Fonts",
                         "LUTs": HOME / "Presets" / "LUTs", "Assets": HOME / "Assets"}.get(folder, audio.LIB / "Uploads")
             dest_dir.mkdir(parents=True, exist_ok=True)
+            data = self.body()
+            if folder == "Logos" and not render.logo_bytes_ok(data, name):
+                return self.send_json({"error": "That logo file couldn't be read. Try a PNG with a transparent background."}, 400)
             dest = dest_dir / name
-            dest.write_bytes(self.body())
-            return self.send_json({"path": str(dest)})
+            dest.write_bytes(data)
+            os.utime(dest, None)  # newest file = default logo
+            return self.send_json({"path": str(dest), "name": dest.name})
+        if path == "/feed-copy" and method == "POST":
+            return self.send_json(feed_copy(self.body().get("path", "")))
         if path == "/music-preview" and method == "POST":
             b = self.body()
             out = audio.LIB / "_previews" / f"{re.sub('[^A-Za-z]', '', b.get('mood', 'x'))}.wav"
@@ -623,12 +675,20 @@ class Handler(BaseHTTPRequestHandler):
             # Team Brand Kit sync: the site sends logos (SVG already rasterised to PNG in the browser), fonts and theme
             kit = self.body()
             (HOME / "Assets" / "brand-kit.json").write_text(json.dumps({k: v for k, v in kit.items() if k != "files"}, indent=1))
+            saved, bad = [], []
             for f in kit.get("files", []):
-                sub = {"logo": "Logos", "font": "Fonts", "lut": "../Presets/LUTs"}.get(f.get("type"), "")
-                dest = (HOME / "Assets" / sub / re.sub(r"[^A-Za-z0-9 ._()-]+", "", f["name"])).resolve()
+                ftype = f.get("type") or ("font" if str(f.get("name", "")).lower().endswith((".ttf", ".otf")) else "logo")
+                sub = {"logo": "Logos", "font": "Fonts", "lut": "../Presets/LUTs"}.get(ftype, "Logos")
+                name = safe_name(f.get("name", ""), "logo.png")
+                data = base64.b64decode(f.get("data") or "")
+                if ftype == "logo" and not render.logo_bytes_ok(data, name):
+                    bad.append(name)
+                    continue
+                dest = (HOME / "Assets" / sub / name).resolve()
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(base64.b64decode(f["data"]))
-            return self.send_json({"ok": True})
+                dest.write_bytes(data)
+                saved.append(name)
+            return self.send_json({"ok": True, "saved": saved, "unreadable": bad})
         return self.send_json({"error": "Not found"}, 404)
 
     def list_assets(self):

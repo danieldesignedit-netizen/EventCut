@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import audio, grade, media
+from . import audio, fxtrans, grade, media
 from .config import HOME, tools
 
 FORMATS = {"9:16": (1080, 1920), "16:9": (1920, 1080), "1:1": (1080, 1080), "4:5": (1080, 1350)}
@@ -18,10 +18,13 @@ XFADE = {
     "whip_l": ("smoothleft", 0.24), "whip_r": ("smoothright", 0.24), "whip_u": ("smoothup", 0.24), "whip": ("smoothleft", 0.24),
     "blurwhip": ("hblur", 0.3), "slide_l": ("slideleft", 0.3), "zoom": ("zoomin", 0.32),
     "flash": ("fadewhite", 0.2), "dip": ("fadeblack", 0.4), "dissolve": ("fade", 0.5),
+    # camera-style moves drawn by fxtrans (built-in look used only if a shot is too short)
+    "tilt": ("zoomin", 0.6), "zoom_in": ("zoomin", 0.4), "zoom_out": ("fade", 0.5), "pan_l": ("smoothleft", 0.44), "pan_u": ("smoothup", 0.44),
 }
 # which sound family goes with each transition
 TRANS_SFX = {"whip_l": "whoosh", "whip_r": "whoosh", "whip_u": "whoosh", "whip": "whoosh", "blurwhip": "whoosh",
-             "slide_l": "whoosh", "zoom": "impact", "flash": "impact", "dip": "reverse", "dissolve": None}
+             "slide_l": "whoosh", "zoom": "impact", "flash": "impact", "dip": "reverse", "dissolve": None,
+             "tilt": "whoosh", "zoom_in": "whoosh", "zoom_out": "reverse", "pan_l": "whoosh", "pan_u": "whoosh"}
 
 
 def _font(name="Poppins-Bold.ttf"):
@@ -58,6 +61,44 @@ def _ass_color(h, alpha=0):
         h = "".join(c * 2 for c in h)
     r, g, b = h[0:2], h[2:4], h[4:6]
     return f"&H{alpha:02X}{b}{g}{r}".upper()
+
+
+LOGO_EXT = {".png", ".webp", ".gif", ".mov", ".webm", ".jpg", ".jpeg"}
+
+
+def logo_bytes_ok(data: bytes, name: str) -> bool:
+    """True when the bytes really are a logo FFmpeg can place (not an error page saved as .png)."""
+    ext = Path(name).suffix.lower()
+    if ext not in LOGO_EXT or len(data) < 32:
+        return False
+    if ext == ".gif":
+        return data[:4] == b"GIF8"
+    if ext == ".mov":
+        return b"ftyp" in data[:16] or b"moov" in data[:4096] or b"mdat" in data[:4096] or b"wide" in data[:16]
+    if ext == ".webm":
+        return data[:4] == b"\x1a\x45\xdf\xa3"
+    try:
+        import cv2
+        img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
+        return img is not None and img.size > 0
+    except Exception:
+        # no decoder available: fall back to signatures
+        return data[:8] == b"\x89PNG\r\n\x1a\n" or data[:3] == b"\xff\xd8\xff" or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+
+
+_logo_checked = {}
+
+
+def logo_path_ok(p: Path) -> bool:
+    try:
+        key = (str(p), p.stat().st_mtime, p.stat().st_size)
+        if key not in _logo_checked:
+            with open(p, "rb") as f:
+                head = f.read(8192) if p.suffix.lower() in (".mov", ".webm", ".gif") else f.read()
+            _logo_checked[key] = logo_bytes_ok(head, p.name)
+        return _logo_checked[key]
+    except OSError:
+        return False
 
 
 def fx_leak(work: Path, style: int = 0) -> Path:
@@ -182,7 +223,7 @@ class Renderer:
             vf.append(f"scale={int(sw * z * 1.1) // 2 * 2}:-2")
             vf.append(f"zoompan=z='min(1+0.10*on/{frames},1.10)':x='({fx}*iw-iw/zoom/2)*(1-0)+0*on':y='ih/2-ih/zoom/2':d={frames}:s={W}x{H}:fps={self.fps}")
         else:
-            args += ["-ss", f"{shot['in']:.3f}", "-t", f"{length:.3f}", "-i", src]
+            args += media.decode_args() + ["-ss", f"{shot['in']:.3f}", "-t", f"{length:.3f}", "-i", src]
             if media.is_hdr(info):
                 vf.append("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
             sw, sh = info.get("width", W), info.get("height", H)
@@ -194,9 +235,10 @@ class Renderer:
                 args[args.index("-t") + 1] = f"{length / factor:.3f}"
                 vf.append(f"setpts={factor:.3f}*PTS")
             m = a.get("moments", [{}])[shot.get("moment", 0)] if a.get("moments") else {}
-            if 0.012 < m.get("shake", 0) <= 0.035 and not self.preview:
-                vf.append("deshake=rx=32:ry=32")
             vf += self.framing(shot, a, sw, sh, length)
+            if 0.012 < m.get("shake", 0) <= 0.035 and not self.preview:
+                # stabilise after the reframe: same result, far less work on 4K footage
+                vf.append("deshake=rx=32:ry=32")
             vf.append(f"fps={self.fps}")
         vf.append(f"lut3d=file='{fpath(lut)}'")
         if self.s.get("preset", "Vibrant Cinematic") in ("Vibrant Cinematic", "Cinematic Teal & Orange", "Warm Celebration") and not self.preview:
@@ -215,7 +257,7 @@ class Renderer:
                      "-filter_complex", f"[0:v]{','.join(vf)}[v]", "-map", "[v]", "-map", "1:a"]
         args += ["-r", str(self.fps)] + media.intermediate_args()
         args += ["-c:a", "pcm_s16le", "-t", f"{length:.3f}", str(out.with_suffix(".mov"))]
-        media.run(args)
+        media.run_decoding(args)
         return out.with_suffix(".mov")
 
     # ------------------------------------------------------------- framing
@@ -312,9 +354,27 @@ class Renderer:
         for k in range(1, len(run_files)):
             trans = runs[k][0][1]["transition"]
             kind, d = XFADE[trans]
+            made = None
+            if trans in fxtrans.CUSTOM:
+                dd = fxtrans.frames_for(d, self.fps) / self.fps
+                if lengths[k - 1] >= 2 * dd + 0.1 and lengths[k] >= 2 * dd + 0.1:
+                    try:
+                        made, _ = fxtrans.make(trans, self.ffmpeg, run_files[k - 1], lengths[k - 1], run_files[k], self.W, self.H, self.fps,
+                                               self.work / f"trans_{k}.mov", seed=int(self.s.get("seed") or 0) + k)
+                        d = dd
+                    except Exception:
+                        made = None
             offset -= d
-            fc.append(f"[{prev_v}][n{k}]xfade=transition={kind}:duration={d}:offset={offset:.3f}[v{k}]")
-            fc.append(f"[{prev_a}][m{k}]acrossfade=d={d}:c1=tri:c2=tri[a{k}]")
+            if made:
+                ti = len(inputs) // 2
+                inputs += ["-i", str(made)]
+                fc.append(f"[{ti}:v]fps={self.fps},format=yuv420p,setsar=1,settb=AVTB,setpts=PTS-STARTPTS[tt{k}]")
+                fc.append(f"[{prev_v}]trim=duration={offset:.4f},setpts=PTS-STARTPTS[pa{k}]")
+                fc.append(f"[n{k}]trim=start={d:.4f},setpts=PTS-STARTPTS[nb{k}]")
+                fc.append(f"[pa{k}][tt{k}][nb{k}]concat=n=3:v=1:a=0[v{k}]")
+            else:
+                fc.append(f"[{prev_v}][n{k}]xfade=transition={kind}:duration={d}:offset={offset:.3f}[v{k}]")
+            fc.append(f"[{prev_a}][m{k}]acrossfade=d={d:.4f}:c1=tri:c2=tri[a{k}]")
             prev_v, prev_a = f"v{k}", f"a{k}"
             offset += lengths[k]
         out = self.work / "body.mov"
@@ -324,14 +384,16 @@ class Renderer:
 
     # ------------------------------------------------------------- graphics
     def logo_file(self):
-        """The chosen logo, else the most recently added one in Assets/Logos (images or animated logos)."""
+        """The chosen logo, else the most recently added readable one in Assets/Logos (images or animated logos)."""
         logo = self.s.get("logo")
-        if logo and Path(logo).exists():
+        if logo and Path(logo).is_file() and logo_path_ok(Path(logo)):
             return Path(logo)
         folder = HOME / "Assets" / "Logos"
-        ok = {".png", ".webp", ".gif", ".mov", ".webm", ".jpg", ".jpeg"}
-        files = [f for f in folder.glob("*") if f.is_file() and f.suffix.lower() in ok] if folder.exists() else []
-        return max(files, key=lambda f: f.stat().st_mtime) if files else None
+        files = [f for f in folder.glob("*") if f.is_file() and f.suffix.lower() in LOGO_EXT] if folder.exists() else []
+        for f in sorted(files, key=lambda f: f.stat().st_mtime, reverse=True):
+            if logo_path_ok(f):
+                return f
+        return None
 
     def logo_overlay(self, idx, base_label, out_label):
         """Filter text that places the logo input #idx as a corner watermark."""
@@ -594,6 +656,8 @@ class Renderer:
         end = None
         if self.s.get("end_card", True):
             end_len = max(1.5, float(self.s.get("duration", 60)) - body_len)
+            if self.plan.get("shortened"):  # not enough footage: keep a normal end card, don't stretch it
+                end_len = max(1.5, float(self.plan.get("end_card") or 2.5))
             end = self.end_card(end_len)
         captions = None
         if self.s.get("captions") and transcripts:
@@ -650,11 +714,11 @@ class Renderer:
             return out
         wants = set(self.s.get("exports") or ["video", "video_only", "audio", "thumbnail"])
         if "video_only" in wants:
-            p = Path(f"{stem} (video only).mp4")
+            p = Path(f"{stem}_video-only.mp4")
             media.run([self.ffmpeg, "-y", "-v", "error", "-i", str(full), "-map", "0:v", "-c", "copy", "-movflags", "+faststart", str(p)])
             out["video_only"] = str(p)
         if "audio" in wants:
-            pw, pm = Path(f"{stem} (audio).wav"), Path(f"{stem} (audio).mp3")
+            pw, pm = Path(f"{stem}_audio.wav"), Path(f"{stem}_audio.mp3")
             shutil.copy(mix, pw)
             media.run([self.ffmpeg, "-y", "-v", "error", "-i", str(mix), "-c:a", "libmp3lame", "-b:a", "320k", str(pm)])
             out["audio_wav"], out["audio_mp3"] = str(pw), str(pm)
@@ -667,7 +731,7 @@ class Renderer:
         used = [p for p in [(self.s.get("music") or {}).get("path")] + list(getattr(self, "used_sfx", [])) if p]
         credits = audio.credits_for(used)
         if credits:
-            cf = Path(f"{stem} (music credits).txt")
+            cf = Path(f"{stem}_music-credits.txt")
             cf.write_text("Music and sound credits (please include these in the post caption or description):\n" + credits + "\n", "utf-8")
             out["credits"] = str(cf)
         if (self.s.get("music") or {}).get("title"):
@@ -683,7 +747,7 @@ class Renderer:
             if sc > best_s and s["length"] >= 0.4:
                 best_s, best_t = sc, t + s["length"] / 2
             t += s["length"]
-        p = Path(str(video).replace(".mp4", " (thumbnail).jpg"))
+        p = Path(str(video)[:-4] + "_thumbnail.jpg")
         vf = "scale=iw:ih"
         title = self.s.get("title")
         if title:

@@ -115,6 +115,8 @@ def _moment_pool(analyses, terms, transcripts, taste, rng, randomness, director=
 
 def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
     """Return {sections, shots, total} where every shot length is a whole number of beats."""
+    if settings.get("order", "chronological") == "chronological":
+        return plan_chronological(analyses, settings, grid, transcripts, taste)
     transcripts = transcripts or {}
     duration = float(settings.get("duration", 60))
     end_card = min(2.5, max(1.5, duration * 0.06)) if settings.get("end_card", True) else 0.0
@@ -147,7 +149,8 @@ def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
         t += length
     bounds[-1][2] = body  # last section absorbs rounding
 
-    used, used_src_time, used_order = set(), [], []
+    used, used_src_time, used_order, used_sigs = set(), [], [], []
+    from .analyze import similarity
     locks = {(l["src"], round(l["start"], 2)): l for l in settings.get("locks", [])}
     shots = []
     last_src = None
@@ -195,6 +198,8 @@ def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
                     fit -= 0.08 if name in ("hook", "peak") else -0.04
                 if c["src"] == last_src:
                     fit -= 0.18
+                if c["m"].get("sig") and any(similarity(c["m"]["sig"], u) > 0.93 for u in used_sigs):
+                    continue  # near-identical to a shot already in the video
                 near = sum(1 for (src, tt) in used_src_time if src == c["src"] and abs(tt - m["start"]) < 6)
                 fit -= 0.12 * near
                 if fit > best_s:
@@ -205,17 +210,16 @@ def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
                          [c for c in pool if (c["src"], c["idx"]) not in used]
                 if unused:
                     best = max(unused, key=lambda c: c["score"] + 0.2 * min(4, c["m"]["end"] - c["m"]["start"]))
-                else:  # every moment used once: reuse the one used longest ago
-                    order = {k: i for i, k in enumerate(used_order)}
-                    last_key = used_order[-1] if used_order else None
-                    others = [c for c in pool if c["src"] != last_src] or [c for c in pool if (c["src"], c["idx"]) != last_key] or pool
-                    best = min(others, key=lambda c: (order.get((c["src"], c["idx"]), -1), -c["score"]))
+                else:  # every moment used once: stop rather than repeat shots
+                    break
                 if best["kind"] != "photo":
                     avail = best["m"]["end"] - best["m"]["start"]
                     length = min(length, max(beat * 0.5, math.floor(avail / (beat * 0.5)) * beat * 0.5))
             m = best["m"]
             used.add((best["src"], best["idx"]))
             used_order.append((best["src"], best["idx"]))
+            if best["m"].get("sig"):
+                used_sigs.append(best["m"]["sig"])
             used_src_time.append((best["src"], m["start"]))
             if best["kind"] == "photo":
                 cin = 0.0
@@ -238,6 +242,7 @@ def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
 
     # transitions: hard cuts on beat, with accents at section changes
     assign_transitions(shots, tmpl_name, rng, settings.get("transition_amount", "normal"))
+    tame_moves(shots, tmpl_name, rng, settings.get("transition_amount", "normal"))
     leaks = []
     total = sum(s["length"] for s in shots)
     usable = sum(c["m"]["end"] - c["m"]["start"] for c in pool if c["kind"] != "photo") + 3 * sum(1 for c in pool if c["kind"] == "photo")
@@ -249,23 +254,60 @@ def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
     return {"template": tmpl_name, "bpm": grid["bpm"], "sections": [{"name": b[0], "start": b[1], "end": b[2]} for b in bounds],
             "shots": shots, "body": round(total, 3), "end_card": round(duration - total, 3), "drop_at": round(peak_start, 3),
             "mood": settings.get("music_mood") or mood_from_prompt(settings.get("prompt", ""), tmpl_name, rng),
-            "leaks": pick_leaks(shots, rng, tmpl_name), "warning": warning}
+            "leaks": pick_leaks(shots, rng, tmpl_name), "warning": warning, "shortened": bool(warning), "order": "highlights"}
 
 
 # Transition families. Names map to an FFmpeg xfade style and duration in render.XFADE.
 SECTION_ACCENTS = {
-    "celebration": {"hook": ["flash", "zoom"], "build": ["whip_l", "whip_r", "blurwhip"], "peak": ["flash", "zoom", "whip_u"],
-                    "emotional": ["dissolve", "dip"], "close": ["dissolve", "blurwhip", "dip"]},
-    "corporate": {"hook": ["zoom", "dissolve"], "build": ["slide_l", "blurwhip"], "peak": ["zoom", "whip_r"],
-                  "emotional": ["dissolve"], "close": ["dissolve", "dip"]},
+    "celebration": {"hook": ["flash", "zoom", "zoom_in"], "build": ["whip_l", "whip_r", "blurwhip", "tilt", "pan_l"], "peak": ["flash", "zoom_in", "whip_u", "tilt"],
+                    "emotional": ["dissolve", "dip", "zoom_out"], "close": ["dissolve", "blurwhip", "dip", "zoom_out"]},
+    "corporate": {"hook": ["zoom", "dissolve", "zoom_in"], "build": ["slide_l", "blurwhip", "tilt", "pan_l"], "peak": ["zoom_in", "whip_r", "tilt"],
+                  "emotional": ["dissolve", "zoom_out"], "close": ["dissolve", "dip", "zoom_out"]},
     "talk": {"hook": ["dissolve"], "build": ["dissolve"], "peak": ["dissolve", "dip"], "close": ["dissolve"]},
 }
 IN_SECTION = {
-    "celebration": {"build": ["whip_l", "whip_r", "blurwhip", "slide_l"], "peak": ["flash", "zoom", "whip_l", "whip_r", "whip_u", "blurwhip"],
+    "celebration": {"build": ["whip_l", "whip_r", "blurwhip", "slide_l", "pan_l", "pan_u"], "peak": ["flash", "zoom", "whip_l", "whip_r", "whip_u", "blurwhip", "zoom_in", "pan_u"],
                     "hook": ["zoom", "flash"], "emotional": ["dissolve"], "close": ["dissolve"]},
     "corporate": {"build": ["slide_l", "blurwhip", "dissolve"], "peak": ["zoom", "blurwhip", "whip_r"], "emotional": ["dissolve"], "close": ["dissolve"]},
     "talk": {},
 }
+
+
+CAMERA_MOVES = ("tilt", "zoom_in", "zoom_out", "pan_l", "pan_u")
+CLASSIC = {"celebration": ["whip_l", "whip_r", "blurwhip"], "corporate": ["blurwhip", "slide_l", "dissolve"], "talk": ["dissolve"]}
+
+
+def tame_moves(shots, tmpl_name, rng, amount="normal"):
+    """Keep the camera-style moves rare and deliberate: at most one tilt (two in long, busy edits), a couple of
+    zooms or pans, never two in a row, and only where both shots are long enough to show the move."""
+    total = sum(s["length"] for s in shots)
+    tilt_cap = 2 if amount == "more" and total > 45 else 1
+    move_cap = {"less": 1, "normal": 2, "more": 4}.get(amount, 2) + (1 if total > 60 else 0)
+    classic = CLASSIC.get(tmpl_name, CLASSIC["celebration"])
+    tilts = moves = 0
+    last_move = -9
+    need = {"tilt": 1.35, "zoom_in": 0.95, "zoom_out": 1.15, "pan_l": 1.05, "pan_u": 1.05}
+    accents = [0] + [i for i, s in enumerate(shots) if i and s.get("transition", "cut") != "cut"] + [len(shots)]
+
+    def run_len(a, b):
+        return sum(x["length"] for x in shots[a:b])
+
+    for i, s in enumerate(shots):
+        t = s.get("transition")
+        if t not in CAMERA_MOVES:
+            continue
+        k = accents.index(i)
+        # the move needs footage on both sides: the stretch since the last transition and until the next one
+        roomy = i > 0 and run_len(accents[k - 1], i) >= need[t] and run_len(i, accents[k + 1]) >= need[t]
+        ok = roomy and i - last_move > 3 and (tilts < tilt_cap if t == "tilt" else moves < move_cap)
+        if ok:
+            last_move = i
+            if t == "tilt":
+                tilts += 1
+            else:
+                moves += 1
+        else:
+            s["transition"] = str(rng.choice(classic)) if i > 0 and shots[i - 1]["length"] >= 0.45 and s["length"] >= 0.45 else "cut"
 
 
 def assign_transitions(shots, tmpl_name, rng, amount="normal"):
@@ -318,3 +360,185 @@ def record_taste(taste: dict, action: str, shot: dict, moment: dict = None) -> d
     taste["photo"] = float(np.clip(taste.get("photo", 0) + sign * lr * (1 if shot.get("kind") == "photo" else -0.2), -0.3, 0.3))
     taste["events"] = taste.get("events", 0) + 1
     return taste
+
+
+# ---------------------------------------------------------------- "As it happened" editor
+def _natural_key(path: str):
+    import os
+    name = os.path.basename(path).lower()
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
+
+
+def source_order(analyses) -> list:
+    """Order clips the way the event happened: camera recording time when most clips have it, else file names
+    (cameras and phones number files in order: IMG_1234, C0001...)."""
+    paths = [a["path"] for a in analyses]
+    stamped = {a["path"]: a.get("captured") for a in analyses if a.get("captured")}
+    if len(stamped) >= max(1, len(paths) * 0.6):
+        return sorted(paths, key=lambda p: (stamped.get(p) or "9999", _natural_key(p)))
+    return sorted(paths, key=_natural_key)
+
+
+def _shot_len(m, beat, pace, calm=False):
+    """Seconds for a shot: energetic moments cut fast, faces and calm moments breathe. Always whole half-beats."""
+    e = m.get("energy", 0)
+    beats = 1.0 if e >= 0.55 else 2.0 if e >= 0.25 else 3.0
+    if calm or m.get("faces", 0) >= 1.5 and e < 0.4:
+        beats += 1.0
+    beats *= pace
+    want = max(0.5, round(beats * 2) / 2) * beat
+    avail = m["end"] - m["start"]
+    if m.get("photo"):
+        return max(want, 2 * beat)
+    if avail < want:
+        want = (avail // (beat * 0.5)) * beat * 0.5
+    return want if want >= max(0.45, beat * 0.5) else 0.0
+
+
+def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
+    """Hook of the very best moments (3-5 s), then the event in the order it happened, using only
+    interesting moments, each used once, without near-identical shots."""
+    from .analyze import similarity
+    transcripts = transcripts or {}
+    duration = float(settings.get("duration", 60))
+    end_card = min(2.5, max(1.5, duration * 0.06)) if settings.get("end_card", True) else 0.0
+    body = duration - end_card
+    tmpl_name = template_for(settings.get("event_type", ""))
+    seed = int(settings.get("seed", 0))
+    rng = np.random.default_rng(seed)
+    pool = _moment_pool(analyses, prompt_terms(settings.get("prompt", "")), transcripts, taste, rng,
+                        randomness=0.12 if seed else 0.02, director=settings.get("director_picks"))
+    if not pool:
+        raise ValueError("No usable shots found. The footage may be too dark, blurry or shaky.")
+    beat = 60.0 / grid["bpm"]
+    style = settings.get("style") or {}
+    pace = float(np.clip(style.get("median_shot", 0.55) / 0.55, 0.5, 3.0)) if style.get("median_shot") else 1.0
+    if tmpl_name == "talk":
+        pace = max(pace, 2.5)
+
+    # only interesting, engaging moments: drop the weakest third (but keep everything if footage is scarce)
+    scores = np.array([c["score"] for c in pool])
+    cutoff = max(0.3, float(np.percentile(scores, 35))) if len(pool) > 12 else 0.0
+    good = [c for c in pool if c["score"] >= cutoff or c["prompt_hit"] > 0]
+
+    chosen, hook = [], []
+
+    def too_similar(c, picked, limit):
+        sig = c["m"].get("sig")
+        return any(similarity(sig, p["m"].get("sig")) > limit for p in picked)
+
+    # 1. hook: the very best moments from across the event, 3-5 seconds, varied sources and looks
+    want_hook = 0.0 if settings.get("hook", True) is False or tmpl_name == "talk" else float(np.clip(body * 0.12, 3.0, 5.0))
+    hook_len = 0.0
+    hb = beat if beat >= 0.42 else beat * 2  # one beat per hook shot (two if the music is very fast)
+    for c in sorted(good, key=lambda c: -(c["score"] + 0.25 * c["m"].get("energy", 0))):
+        if hook_len >= want_hook - 0.05:
+            break
+        avail = c["m"]["end"] - c["m"]["start"]
+        if (c["kind"] != "photo" and avail < hb) or too_similar(c, hook, 0.82):
+            continue
+        if sum(1 for h in hook if h["src"] == c["src"]) >= max(1, len(hook) // 2):
+            continue  # spread the hook across clips
+        hook.append(c)
+        hook_len += hb
+
+    # 2. the story: best moments first, then laid out in the order they happened
+    remaining = body - hook_len
+    hook_keys = {(h["src"], h["idx"]) for h in hook}
+    per_scene, picked_len = {}, 0.0
+    for c in sorted(good, key=lambda c: -c["score"]):
+        if picked_len >= remaining:
+            break
+        if (c["src"], c["idx"]) in hook_keys or too_similar(c, hook, 0.9):
+            continue  # never show the hook moments again
+        m = c["m"]
+        L = _shot_len(m, beat, pace)
+        if L <= 0:
+            continue
+        key = (c["src"], m.get("scene", 0))
+        cap = 1 + int(m.get("scene_len", 0) // 7)  # long takes may give a few moments, short scenes one
+        if per_scene.get(key, 0) >= cap:
+            continue
+        if any(o["src"] == c["src"] and abs(o["m"]["start"] - m["start"]) < 2.5 for o in chosen):
+            continue  # moments from the same stretch of a clip look like a repeat
+        if too_similar(c, [o for o in chosen if (o["src"], o["m"].get("scene", 0)) != key], 0.93):
+            continue  # same person/place in another clip
+        c["len"] = L
+        chosen.append(c)
+        per_scene[key] = per_scene.get(key, 0) + 1
+        picked_len += L
+    # too long: drop the weakest picks (keeping each clip represented if possible)
+    while picked_len > remaining + beat * 0.5 and len(chosen) > 1:
+        counts = {}
+        for o in chosen:
+            counts[o["src"]] = counts.get(o["src"], 0) + 1
+        drop = min((o for o in chosen if counts[o["src"]] > 1) or chosen, key=lambda o: o["score"])
+        chosen.remove(drop)
+        picked_len -= drop["len"]
+
+    order = {p: i for i, p in enumerate(source_order(analyses))}
+    chosen.sort(key=lambda o: (order.get(o["src"], 0), o["m"]["start"]))
+
+    def shot(c, length, section):
+        m = c["m"]
+        cin = 0.0 if c["kind"] == "photo" else m["start"] + max(0.0, ((m["end"] - m["start"]) - length) / 2)
+        return {"src": c["src"], "kind": c["kind"], "in": round(cin, 3), "out": round(cin + length, 3), "length": round(length, 4),
+                "section": section, "face_x": m.get("face_x", 0.5), "fps": c["fps"], "log": c["log"], "moment": c["idx"],
+                "score": round(c["score"], 3), "prompt_hit": c["prompt_hit"] > 0}
+
+    shots = [shot(h, hb, "hook") for h in hook]
+    total_story = sum(o["len"] for o in chosen) or 1
+    t = 0.0
+    for o in chosen:
+        f = t / total_story
+        section = "build" if f < 0.35 else "peak" if f < 0.72 else "emotional" if f < 0.9 else "close"
+        shots.append(shot(o, o["len"], section))
+        t += o["len"]
+
+    total = sum(s["length"] for s in shots)
+    warning, shortened = None, False
+    if total < body - beat * 2:
+        shortened = True
+        warning = (f"There were only enough interesting moments for about {int(round(total + end_card))} seconds, "
+                   f"so the video is shorter than {int(duration)} seconds instead of repeating shots. Add more footage for a longer cut.")
+    assign_transitions_chrono(shots, tmpl_name, rng, settings.get("transition_amount", "normal"))
+    tame_moves(shots, tmpl_name, rng, settings.get("transition_amount", "normal"))
+    leaks, tt = [], 0.0
+    for i, s in enumerate(shots):
+        if i and s["transition"] != "cut" and len(leaks) < 4 and (s["section"] != shots[i - 1]["section"] or rng.random() < 0.3):
+            leaks.append({"at": round(max(0.0, tt - 0.25), 3), "style": int(rng.integers(0, 4))})
+        tt += s["length"]
+    if tmpl_name == "talk":
+        leaks = []
+    return {"template": tmpl_name, "order": "chronological", "bpm": grid["bpm"],
+            "sections": [{"name": "hook", "start": 0, "end": round(hook_len, 3)}, {"name": "story", "start": round(hook_len, 3), "end": round(total, 3)}],
+            "shots": shots, "body": round(total, 3), "end_card": round(end_card if shortened else max(end_card, duration - total), 3),
+            "drop_at": round(hook_len, 3) if hook_len else round(min(total * 0.3, 8 * beat * 4), 3),
+            "mood": settings.get("music_mood") or mood_from_prompt(settings.get("prompt", ""), tmpl_name, rng),
+            "leaks": leaks, "warning": warning, "shortened": shortened}
+
+
+def assign_transitions_chrono(shots, tmpl_name, rng, amount="normal"):
+    """Cuts on the beat inside a clip; accents where the story moves to the next clip; a punchy accent out of the hook."""
+    fam = {"celebration": ["whip_l", "whip_r", "blurwhip", "zoom", "flash", "slide_l", "tilt", "zoom_in", "zoom_out", "pan_l", "pan_u"],
+           "corporate": ["blurwhip", "slide_l", "dissolve", "zoom", "tilt", "zoom_out", "pan_l"], "talk": ["dissolve"]}.get(tmpl_name, ["whip_l", "blurwhip", "zoom"])
+    within_every = {"less": 0, "normal": 0, "more": 4}.get(amount, 0)
+    accent_chance = {"less": 0.5, "normal": 0.85, "more": 1.0}.get(amount, 0.85)
+    since = 0
+    for i, s in enumerate(shots):
+        s["transition"] = "cut"
+        if i == 0:
+            continue
+        prev = shots[i - 1]
+        if prev["section"] == "hook" and s["section"] != "hook":
+            s["transition"] = str(rng.choice(["flash", "zoom_in", "whip_u", "tilt"])) if tmpl_name != "talk" else "dissolve"
+            since = 0
+        elif s["src"] != prev["src"] and prev["section"] != "hook" and s["section"] != "hook":
+            if rng.random() < accent_chance and prev["length"] >= 0.45 and s["length"] >= 0.45:
+                s["transition"] = "dissolve" if s["section"] in ("emotional", "close") and rng.random() < 0.5 else str(rng.choice(fam))
+            since = 0
+        else:
+            since += 1
+            if within_every and since >= within_every and s["section"] != "hook" and s["length"] >= 0.45:
+                s["transition"] = str(rng.choice(fam))
+                since = 0
