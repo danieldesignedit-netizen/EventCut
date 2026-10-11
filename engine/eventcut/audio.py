@@ -40,7 +40,7 @@ def detect_beats(path: str) -> dict:
     # parabolic refinement for sub-frame tempo accuracy
     if 1 <= lag < len(ac) - 1:
         a0, a1, a2 = ac[lag - 1], ac[lag], ac[lag + 1]
-        lagf = lag + 0.5 * (a0 - a2) / (a0 - 2 * a1 + a2 + 1e-12)
+        lagf = float(lag + 0.5 * (a0 - a2) / (a0 - 2 * a1 + a2 + 1e-12))
     else:
         lagf = float(lag)
     period = lag
@@ -52,7 +52,7 @@ def detect_beats(path: str) -> dict:
     strengths = [flux[bidx[k::4]].sum() for k in range(4)]
     db = int(np.argmax(strengths))
     rms = np.sqrt(signal.convolve(y ** 2, np.ones(sr) / sr, mode="same")[::sr // 4])
-    out = {"bpm": round(60 * fps / lagf, 1), "beats": [round(float(b), 3) for b in beats],
+    out = {"bpm": round(float(60 * fps / lagf), 1), "beats": [round(float(b), 3) for b in beats],
            "downbeats": [round(float(b), 3) for b in beats[db::4]],
            "energy": [round(float(x), 4) for x in rms / (rms.max() + 1e-9)], "energy_rate": 4,
            "duration": round(len(y) / sr, 2)}

@@ -207,7 +207,9 @@ def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
                     best = max(unused, key=lambda c: c["score"] + 0.2 * min(4, c["m"]["end"] - c["m"]["start"]))
                 else:  # every moment used once: reuse the one used longest ago
                     order = {k: i for i, k in enumerate(used_order)}
-                    best = min((c for c in pool if c["src"] != last_src) or pool, key=lambda c: order.get((c["src"], c["idx"]), -1))
+                    last_key = used_order[-1] if used_order else None
+                    others = [c for c in pool if c["src"] != last_src] or [c for c in pool if (c["src"], c["idx"]) != last_key] or pool
+                    best = min(others, key=lambda c: (order.get((c["src"], c["idx"]), -1), -c["score"]))
                 if best["kind"] != "photo":
                     avail = best["m"]["end"] - best["m"]["start"]
                     length = min(length, max(beat * 0.5, math.floor(avail / (beat * 0.5)) * beat * 0.5))
@@ -229,18 +231,25 @@ def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
             t += length
         # keep a sense of time: build/emotional/close follow the order things happened
         if name in ("build", "emotional", "close"):
-            section_shots.sort(key=lambda s: (s["src"], s["in"]))
+            keys = [(x["src"], round(x["in"], 2)) for x in section_shots]
+            if len(set(keys)) == len(keys):  # only when no shot repeats, or repeats would end up side by side
+                section_shots.sort(key=lambda s: (s["src"], s["in"]))
         shots.extend(section_shots)
 
     # transitions: hard cuts on beat, with accents at section changes
     assign_transitions(shots, tmpl_name, rng, settings.get("transition_amount", "normal"))
     leaks = []
     total = sum(s["length"] for s in shots)
+    usable = sum(c["m"]["end"] - c["m"]["start"] for c in pool if c["kind"] != "photo") + 3 * sum(1 for c in pool if c["kind"] == "photo")
+    warning = None
+    if usable < body * 0.8:
+        warning = (f"There are only about {int(usable)} seconds of usable footage for a {int(duration)}-second video, "
+                   "so some shots are repeated. Add more footage or choose a shorter length.")
     peak_start = next((b[1] for b in bounds if b[0] == "peak"), body * 0.35)
     return {"template": tmpl_name, "bpm": grid["bpm"], "sections": [{"name": b[0], "start": b[1], "end": b[2]} for b in bounds],
             "shots": shots, "body": round(total, 3), "end_card": round(duration - total, 3), "drop_at": round(peak_start, 3),
             "mood": settings.get("music_mood") or mood_from_prompt(settings.get("prompt", ""), tmpl_name, rng),
-            "leaks": pick_leaks(shots, rng, tmpl_name)}
+            "leaks": pick_leaks(shots, rng, tmpl_name), "warning": warning}
 
 
 # Transition families. Names map to an FFmpeg xfade style and duration in render.XFADE.

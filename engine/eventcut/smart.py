@@ -47,9 +47,10 @@ def transcribe(path: str, key: str, progress=None) -> list:
     words = []
     for seg in segments:
         for w in seg.words or []:
-            words.append({"word": w.word, "start": round(w.start, 2), "end": round(w.end, 2), "p": round(w.probability, 2)})
+            words.append({"word": str(w.word), "start": round(float(w.start), 2), "end": round(float(w.end), 2),
+                          "p": round(float(w.probability), 2)})
         if progress and info.duration:
-            progress(min(1.0, seg.end / info.duration))
+            progress(min(1.0, float(seg.end) / float(info.duration)))
     out.write_text(json.dumps(words), "utf-8")
     return words
 
