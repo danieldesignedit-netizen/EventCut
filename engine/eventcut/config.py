@@ -6,7 +6,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 PORT = int(os.environ.get("EVENTCUT_PORT", "7788"))
 
 # Origins allowed to drive this engine. The installer writes the real Netlify URL

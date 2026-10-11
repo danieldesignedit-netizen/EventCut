@@ -61,17 +61,26 @@ def prompt_terms(prompt: str):
     return [w for w in words if w not in stop]
 
 
-def mood_from_prompt(prompt: str, template: str) -> str:
+MOOD_WORDS = {
+    "emotional": ("emotional", "touching", "sentimental", "heartfelt", "farewell", "tribute", "memorial", "inspiring"),
+    "cinematic": ("cinematic", "epic", "dramatic", "night", "trailer", "powerful"),
+    "corporate": ("corporate", "professional", "clean", "conference", "award"),
+    "chill": ("chill", "relaxed", "calm", "soft", "lofi", "lo-fi", "acoustic"),
+    "upbeat": ("upbeat", "party", "dance", "afro", "amapiano", "energetic", "fun", "hype"),
+}
+
+
+def mood_from_prompt(prompt: str, template: str, rng=None) -> str:
+    """Mood family for the music: upbeat, cinematic, corporate, chill or emotional."""
     p = (prompt or "").lower()
-    if any(w in p for w in ("emotional", "touching", "sentimental", "heartfelt", "farewell", "tribute")):
-        return "Emotional Piano"
-    if any(w in p for w in ("cinematic", "epic", "dramatic", "night")):
-        return "Cinematic Night"
-    if any(w in p for w in ("corporate", "professional", "clean")) or template == "corporate":
-        return "Corporate Bright"
-    if any(w in p for w in ("chill", "relaxed", "calm", "soft")) or template == "talk":
-        return "Chill Celebration"
-    return "Upbeat Afro House"
+    for mood, words in MOOD_WORDS.items():
+        if any(w in p for w in words):
+            return mood
+    if template == "corporate":
+        return "corporate"
+    if template == "talk":
+        return "chill"
+    return "upbeat"
 
 
 def _moment_pool(analyses, terms, transcripts, taste, rng, randomness, director=None):
@@ -108,7 +117,7 @@ def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
     """Return {sections, shots, total} where every shot length is a whole number of beats."""
     transcripts = transcripts or {}
     duration = float(settings.get("duration", 60))
-    end_card = min(2.5, max(1.5, duration * 0.06))
+    end_card = min(2.5, max(1.5, duration * 0.06)) if settings.get("end_card", True) else 0.0
     body = duration - end_card
     tmpl_name = template_for(settings.get("event_type", ""))
     tmpl = TEMPLATES[tmpl_name]
@@ -224,20 +233,67 @@ def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
         shots.extend(section_shots)
 
     # transitions: hard cuts on beat, with accents at section changes
-    transitions = {"hook": "flash", "build": "whip", "peak": "flash", "emotional": "dissolve", "close": "whip"}
-    prev = None
-    for i, s in enumerate(shots):
-        s["transition"] = "cut"
-        if i > 0 and s["section"] != prev:
-            s["transition"] = transitions.get(s["section"], "cut")
-            if tmpl_name == "talk":
-                s["transition"] = "dissolve"
-        prev = s["section"]
+    assign_transitions(shots, tmpl_name, rng, settings.get("transition_amount", "normal"))
+    leaks = []
     total = sum(s["length"] for s in shots)
     peak_start = next((b[1] for b in bounds if b[0] == "peak"), body * 0.35)
     return {"template": tmpl_name, "bpm": grid["bpm"], "sections": [{"name": b[0], "start": b[1], "end": b[2]} for b in bounds],
             "shots": shots, "body": round(total, 3), "end_card": round(duration - total, 3), "drop_at": round(peak_start, 3),
-            "mood": settings.get("music_mood") or mood_from_prompt(settings.get("prompt", ""), tmpl_name)}
+            "mood": settings.get("music_mood") or mood_from_prompt(settings.get("prompt", ""), tmpl_name, rng),
+            "leaks": pick_leaks(shots, rng, tmpl_name)}
+
+
+# Transition families. Names map to an FFmpeg xfade style and duration in render.XFADE.
+SECTION_ACCENTS = {
+    "celebration": {"hook": ["flash", "zoom"], "build": ["whip_l", "whip_r", "blurwhip"], "peak": ["flash", "zoom", "whip_u"],
+                    "emotional": ["dissolve", "dip"], "close": ["dissolve", "blurwhip", "dip"]},
+    "corporate": {"hook": ["zoom", "dissolve"], "build": ["slide_l", "blurwhip"], "peak": ["zoom", "whip_r"],
+                  "emotional": ["dissolve"], "close": ["dissolve", "dip"]},
+    "talk": {"hook": ["dissolve"], "build": ["dissolve"], "peak": ["dissolve", "dip"], "close": ["dissolve"]},
+}
+IN_SECTION = {
+    "celebration": {"build": ["whip_l", "whip_r", "blurwhip", "slide_l"], "peak": ["flash", "zoom", "whip_l", "whip_r", "whip_u", "blurwhip"],
+                    "hook": ["zoom", "flash"], "emotional": ["dissolve"], "close": ["dissolve"]},
+    "corporate": {"build": ["slide_l", "blurwhip", "dissolve"], "peak": ["zoom", "blurwhip", "whip_r"], "emotional": ["dissolve"], "close": ["dissolve"]},
+    "talk": {},
+}
+
+
+def assign_transitions(shots, tmpl_name, rng, amount="normal"):
+    """Hard cuts on the beat stay the backbone; accents land at section changes and every few cuts,
+    chosen at random from the right family so each regenerate looks different."""
+    every = {"less": (7, 11), "normal": (3, 6), "more": (2, 4)}.get(amount, (3, 6))
+    accents, inner = SECTION_ACCENTS.get(tmpl_name, SECTION_ACCENTS["celebration"]), IN_SECTION.get(tmpl_name, {})
+    prev, since, gap = None, 0, int(rng.integers(*every))
+    for i, sh in enumerate(shots):
+        sh["transition"] = "cut"
+        if i == 0:
+            prev = sh["section"]
+            continue
+        if sh["section"] != prev:
+            choices = accents.get(sh["section"], ["dissolve"])
+            sh["transition"] = str(rng.choice(choices))
+            since, gap = 0, int(rng.integers(*every))
+        else:
+            since += 1
+            pool = inner.get(sh["section"])
+            # only on shots long enough to carry a transition without feeling rushed
+            if pool and since >= gap and shots[i - 1]["length"] >= 0.45 and sh["length"] >= 0.45:
+                sh["transition"] = str(rng.choice(pool))
+                since, gap = 0, int(rng.integers(*every))
+        prev = sh["section"]
+
+
+def pick_leaks(shots, rng, tmpl_name):
+    """Light-leak flares over a few key moments (section changes and the drop)."""
+    if tmpl_name == "talk":
+        return []
+    out, t = [], 0.0
+    for i, sh in enumerate(shots):
+        if i and shots[i - 1]["section"] != sh["section"] and rng.random() < 0.75:
+            out.append({"at": round(max(0.0, t - 0.25), 3), "style": int(rng.integers(0, 4))})
+        t += sh["length"]
+    return out[:5]
 
 
 def record_taste(taste: dict, action: str, shot: dict, moment: dict = None) -> dict:

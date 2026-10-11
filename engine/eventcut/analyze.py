@@ -39,7 +39,7 @@ def _detect_faces(img):
 
 def cache_key(path: str) -> str:
     st = Path(path).stat()
-    return hashlib.sha1(f"{path}|{st.st_size}|{int(st.st_mtime)}|v4".encode()).hexdigest()[:16]
+    return hashlib.sha1(f"{path}|{st.st_size}|{int(st.st_mtime)}|v5".encode()).hexdigest()[:16]
 
 
 def _frame_metrics(frame, prev_gray, detect_faces):
@@ -62,8 +62,15 @@ def _frame_metrics(frame, prev_gray, detect_faces):
         m["rgb"] = [round(float(small[..., c][mid].mean() / 255.0), 4) for c in (2, 1, 0)]
     else:
         m["rgb"] = [m["luma"]] * 3
+    m["fx"], m["fy"], m["focus"] = 0.5, 0.45, "centre"
     if prev_gray is not None and prev_gray.shape == gray.shape:
-        m["motion"] = float(np.abs(gray.astype(np.int16) - prev_gray.astype(np.int16)).mean() / 255.0)
+        diff = np.abs(gray.astype(np.int16) - prev_gray.astype(np.int16))
+        m["motion"] = float(diff.mean() / 255.0)
+        # where the action is: centroid of strong changes (used when there are no faces)
+        mask = diff > 28
+        if mask.mean() > 0.004:
+            ys, xs = np.nonzero(mask)
+            m["fx"], m["fy"], m["focus"] = float(xs.mean() / gray.shape[1]), float(ys.mean() / gray.shape[0]), "motion"
         (dx, dy), _ = cv2.phaseCorrelate(np.float32(prev_gray), np.float32(gray))
         m["shift"] = float(np.hypot(dx, dy) / gray.shape[1])
     if detect_faces:
@@ -77,7 +84,13 @@ def _frame_metrics(frame, prev_gray, detect_faces):
                      skin_luma=float(lum[y + h // 4: y + 3 * h // 4, x + w // 4: x + 3 * w // 4].mean()))
             # weighted centre of all faces keeps groups in frame when reframing
             cx = sum((fx + fw / 2) * fw * fh for fx, fy, fw, fh in faces) / sum(areas)
+            cy = sum((fy + fh / 2) * fw * fh for fx, fy, fw, fh in faces) / sum(areas)
             m["group_x"] = float(cx / gray.shape[1])
+            m["group_y"] = float(cy / gray.shape[0])
+            # spread of all faces, so a crop never cuts people out of a group
+            m["span"] = [float(min(fx for fx, _, _, _ in faces) / gray.shape[1]), float(max(fx + fw for fx, _, fw, _ in faces) / gray.shape[1]),
+                         float(min(fy for _, fy, _, _ in faces) / gray.shape[0]), float(max(fy + fh for _, fy, _, fh in faces) / gray.shape[0])]
+            m["fx"], m["fy"], m["focus"] = m["group_x"], m["group_y"], "faces"
     return m, gray
 
 
@@ -127,7 +140,7 @@ def analyse_video(path: str, progress=None) -> dict:
     # carry face data to the odd frames we skipped
     for j in range(1, len(frames)):
         if frames[j]["faces"] == 0 and frames[j - 1]["faces"] > 0 and j % 2 == 1:
-            for k in ("faces", "face_x", "face_y", "face_area", "skin_luma", "group_x"):
+            for k in ("faces", "face_x", "face_y", "face_area", "skin_luma", "group_x", "group_y", "span", "fx", "fy", "focus"):
                 if k in frames[j - 1]:
                     frames[j][k] = frames[j - 1][k]
 

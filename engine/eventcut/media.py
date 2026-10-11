@@ -147,32 +147,77 @@ def has_encoder(name: str) -> bool:
     return name in (p.stdout or b"").decode()
 
 
-_GPU = None
+_HW = None
+
+
+def _try_encoder(enc: str, extra=()) -> tuple:
+    ffmpeg, _ = tools()
+    p = run([ffmpeg, "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=1280x720:r=25:d=0.5", "-pix_fmt", "yuv420p",
+             "-c:v", enc, *extra, "-f", "null", "-"], check=False, timeout=60)
+    lines = (p.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+    import re as _re
+    # the first line from the encoder itself explains the cause (e.g. "Driver does not support the required nvenc API version")
+    useful = [_re.sub(r"^\[[^\]]+\]\s*", "", l) for l in lines if not l.startswith("[out#") and "Nothing was written" not in l]
+    return p.returncode == 0, (useful[0] if useful else (lines[-1] if lines else ""))
+
+
+def hardware() -> dict:
+    """Find a working hardware video encoder: NVIDIA (NVENC), then AMD (AMF), then Intel (Quick Sync).
+
+    Each one is test-encoded, because an encoder can be present in FFmpeg yet unusable
+    (for example an NVIDIA driver that is too old for this FFmpeg build)."""
+    global _HW
+    if _HW is not None:
+        return _HW
+    notes = []
+    for kind, h264, hevc, label in [("nvenc", "h264_nvenc", "hevc_nvenc", "NVIDIA GPU"),
+                                    ("amf", "h264_amf", "hevc_amf", "AMD GPU"),
+                                    ("qsv", "h264_qsv", "hevc_qsv", "Intel GPU")]:
+        if not has_encoder(h264):
+            continue
+        ok, err = _try_encoder(h264)
+        if ok:
+            _HW = {"kind": kind, "h264": h264, "hevc": hevc, "label": label, "notes": notes}
+            return _HW
+        hint = ""
+        if kind == "nvenc" and ("API" in err or "driver" in err.lower() or "nvenc" in err.lower()):
+            hint = " Update the NVIDIA driver (NVIDIA app or nvidia.com/drivers) to the latest version."
+        notes.append(f"{label}: {err[:160]}{hint}")
+    _HW = {"kind": None, "label": "Processor only", "notes": notes}
+    return _HW
+
+
+def nvidia_ok() -> bool:
+    return hardware().get("kind") == "nvenc"
 
 
 def gpu_available() -> bool:
-    """True only if NVENC really works on this machine (encoder present AND a test encode succeeds)."""
-    global _GPU
-    if _GPU is None:
-        ffmpeg, _ = tools()
-        if not has_encoder("h264_nvenc"):
-            _GPU = False
-        else:
-            p = run([ffmpeg, "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=256x256:d=0.2", "-c:v", "h264_nvenc", "-f", "null", "-"], check=False)
-            _GPU = p.returncode == 0
-    return _GPU
+    return hardware().get("kind") is not None
 
 
 def video_encoder_args(quality: str = "high", codec: str = "h264") -> list:
-    if gpu_available():
-        enc = "hevc_nvenc" if codec == "h265" else "h264_nvenc"
-        return ["-c:v", enc, "-preset", "p5", "-rc", "vbr", "-cq", "19" if quality == "high" else "24", "-b:v", "0"]
+    hw = hardware()
+    k = hw.get("kind")
+    if k:
+        enc = hw["hevc"] if codec == "h265" else hw["h264"]
+        if k == "nvenc":
+            return ["-c:v", enc, "-preset", "p5", "-rc", "vbr", "-cq", "19" if quality == "high" else "24", "-b:v", "0"]
+        if k == "amf":
+            q = "18" if quality == "high" else "24"
+            return ["-c:v", enc, "-quality", "quality" if quality == "high" else "speed", "-rc", "cqp", "-qp_i", q, "-qp_p", q, "-qp_b", q]
+        if k == "qsv":
+            return ["-c:v", enc, "-preset", "slower" if quality == "high" else "fast", "-global_quality", "20" if quality == "high" else "26"]
     enc = "libx265" if codec == "h265" and has_encoder("libx265") else "libx264"
     return ["-c:v", enc, "-preset", "medium" if quality == "high" else "veryfast", "-crf", "18" if quality == "high" else "23"]
 
 
 def intermediate_args() -> list:
     """Near-lossless, very fast codec for working files (only the final export is compressed properly)."""
-    if gpu_available():
+    hw = hardware()
+    if hw.get("kind") == "nvenc":
         return ["-c:v", "h264_nvenc", "-preset", "p2", "-rc", "constqp", "-qp", "14"]
+    if hw.get("kind") == "amf":
+        return ["-c:v", "h264_amf", "-quality", "speed", "-rc", "cqp", "-qp_i", "14", "-qp_p", "14", "-qp_b", "14"]
+    if hw.get("kind") == "qsv":
+        return ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "16"]
     return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "12"]

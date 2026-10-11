@@ -35,7 +35,7 @@ def transcribe(path: str, key: str, progress=None) -> list:
     from faster_whisper import WhisperModel
     if _whisper is None:
         import sys
-        device = "cuda" if media.gpu_available() else "cpu"
+        device = "cuda" if media.nvidia_ok() else "cpu"
         bundled = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent)) / "models" / "whisper"
         size = "medium" if device == "cuda" else "small"  # medium downloads once (about 1.5 GB) on GPU PCs
         root = str(bundled) if size == "small" and bundled.exists() else str(HOME / "Projects" / "_models")

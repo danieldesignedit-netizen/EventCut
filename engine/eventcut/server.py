@@ -250,12 +250,19 @@ def run_generate(job: Job):
             s["match_look"] = smart.frame_lab(s["look_ref"]["path"], s["look_ref"].get("t"))
         taste = smart.load_taste() if s.get("learn_taste", True) else None
         music = s.get("music") or {}
+        seed = int(s.get("seed", 0))
+        if not music.get("path") and not music.get("mood"):
+            # automatic: new music for every version (library track for the mood if online, else an original)
+            family = s.get("music_family") or story.mood_from_prompt(s.get("prompt", ""), story.template_for(s.get("event_type", "")))
+            job.update(0.3, "Choosing music")
+            music = audio.pick_auto_music(family, dur, seed, online=s.get("online_music", True))
+            s["music"] = music
         if music.get("path"):
             grid = audio.detect_beats(music["path"])
         else:
-            mood = music.get("mood") or story.mood_from_prompt(s.get("prompt", ""), story.template_for(s.get("event_type", "")))
-            grid = audio.music_grid(mood, dur)
+            grid = audio.music_grid(music["mood"], dur, seed)
         plan = p.get("plan") or story.plan_edit(analyses, s, grid, transcripts, taste)
+        plan["music"] = {k: music.get(k) for k in ("path", "mood", "title", "creator", "license", "source")}
         job.update(1.0)
         # 5. render each format
         out_dir = project_dir(s.get("name") or s.get("event_type") or "Event")
@@ -455,7 +462,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/health":
                 cfg = load_settings()
-                return self.send_json({"ok": True, "version": VERSION, "gpu": media.gpu_available(),
+                return self.send_json({"ok": True, "version": VERSION, "gpu": media.gpu_available(), "gpu_label": media.hardware().get("label"),
+                                       "gpu_notes": media.hardware().get("notes", []),
                                        "whisper": smart.whisper_available(), "home": str(HOME),
                                        "linked": bool(cfg.get("supabase_url")), "cpu_threads": os.cpu_count()})
             if path == "/link" and method == "POST":
@@ -526,6 +534,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.thumb(q.get("path", [""])[0], float(q.get("t", ["1"])[0]), int(q.get("w", ["480"])[0]))
         if path == "/grade-preview" and method == "POST":
             return self.grade_preview(self.body())
+        if path == "/library/search":
+            try:
+                return self.send_json(audio.search_online(q.get("q", [""])[0], q.get("category", ["music"])[0], int(q.get("page", ["1"])[0])))
+            except Exception:
+                return self.send_json({"error": "The online library can't be reached. Check your internet connection.", "results": []}, 502)
+        if path == "/library/add" and method == "POST":
+            b = self.body()
+            return self.send_json({"path": audio.download_online(b["item"], b.get("category", "music"))})
         if path == "/library":
             return self.send_json(audio.ensure_library())
         if path == "/library/upload" and method == "POST":
