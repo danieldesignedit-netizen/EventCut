@@ -23,35 +23,71 @@ def whisper_available() -> bool:
         return False
 
 
+class Skipped(Exception):
+    """The person chose to skip listening; keep what was heard so far."""
+
+
+def _load_whisper():
+    """Small model on the processor (bundled, works everywhere); a larger one on NVIDIA GPUs only if CUDA really works."""
+    global _whisper
+    if _whisper is not None:
+        return _whisper
+    import os
+    import sys
+    from faster_whisper import WhisperModel
+    bundled = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent)) / "models" / "whisper"
+    cpu_root = str(bundled) if bundled.exists() else str(HOME / "Projects" / "_models")
+    if media.nvidia_ok():
+        try:
+            m = WhisperModel("small", device="cuda", compute_type="float16", download_root=cpu_root)
+            list(m.transcribe(np.zeros(16000, np.float32), beam_size=1)[0])  # proves the CUDA libraries load
+            _whisper = ("cuda", m)
+            return _whisper
+        except Exception:
+            pass
+    threads = max(2, (os.cpu_count() or 4) - 1)
+    _whisper = ("cpu", WhisperModel("small", device="cpu", compute_type="int8", cpu_threads=threads, download_root=cpu_root))
+    return _whisper
+
+
+def _audio_16k(path: str) -> np.ndarray:
+    """Pull just the sound out with FFmpeg (fast even for huge 4K files) as 16 kHz mono for the speech model."""
+    ff, _ = media.tools()
+    p = media.run([ff, "-v", "error", "-i", path, "-vn", "-sn", "-dn", "-map", "0:a:0", "-ac", "1", "-ar", "16000",
+                   "-af", "highpass=f=80,lowpass=f=7600", "-f", "f32le", "-"])
+    return np.frombuffer(p.stdout, np.float32)
+
+
 def transcribe(path: str, key: str, progress=None) -> list:
-    """Word-level transcript with faster-whisper on the GPU (CPU fallback). Cached per file."""
+    """Word-level transcript with faster-whisper. Cached per file, so a stopped run picks up where it left off.
+
+    progress(fraction, note) is called often; it may raise Skipped (keep partial words) or InterruptedError (cancel)."""
     TRANS_CACHE.mkdir(parents=True, exist_ok=True)
     out = TRANS_CACHE / f"{key}.json"
     if out.exists():
         return json.loads(out.read_text("utf-8"))
     if not whisper_available():
         return []
-    global _whisper
-    from faster_whisper import WhisperModel
-    if _whisper is None:
-        import sys
-        device = "cuda" if media.nvidia_ok() else "cpu"
-        bundled = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent)) / "models" / "whisper"
-        size = "medium" if device == "cuda" else "small"  # medium downloads once (about 1.5 GB) on GPU PCs
-        root = str(bundled) if size == "small" and bundled.exists() else str(HOME / "Projects" / "_models")
-        try:
-            _whisper = WhisperModel(size, device=device, compute_type="float16" if device == "cuda" else "int8", download_root=root)
-        except Exception:  # GPU libraries missing: fall back to the CPU
-            _whisper = WhisperModel("small", device="cpu", compute_type="int8", download_root=str(bundled) if bundled.exists() else root)
-    segments, info = _whisper.transcribe(path, word_timestamps=True, vad_filter=True)
-    words = []
-    for seg in segments:
-        for w in seg.words or []:
-            words.append({"word": str(w.word), "start": round(float(w.start), 2), "end": round(float(w.end), 2),
-                          "p": round(float(w.probability), 2)})
-        if progress and info.duration:
-            progress(min(1.0, float(seg.end) / float(info.duration)))
-    out.write_text(json.dumps(words), "utf-8")
+    if progress:
+        progress(0.0, "Taking out the sound")
+    audio16 = _audio_16k(path)
+    total = len(audio16) / 16000 or 1
+    device, model = _load_whisper()
+    segments, _ = model.transcribe(audio16, word_timestamps=True, vad_filter=True, beam_size=1, best_of=1,
+                                   condition_on_previous_text=False, vad_parameters={"min_silence_duration_ms": 500})
+    words, skipped = [], False
+    try:
+        for seg in segments:
+            for w in seg.words or []:
+                words.append({"word": str(w.word), "start": round(float(w.start), 2), "end": round(float(w.end), 2),
+                              "p": round(float(w.probability), 2)})
+            if progress:
+                done = float(seg.end)
+                progress(min(1.0, done / total), f"{int(done // 60)} of {int(total // 60)} min heard")
+    except Skipped:
+        skipped = True
+    if not skipped:  # only cache complete transcripts
+        out.write_text(json.dumps(words), "utf-8")
     return words
 
 

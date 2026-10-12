@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import analyze, audio, grade, media, render, smart, story
+from . import analyze, audio, gemini, grade, media, render, smart, story
 from .config import HOME, PORT, VERSION, ensure_folders, load_settings, save_settings
 
 JOBS = {}
@@ -95,7 +95,7 @@ def path_allowed(p: str) -> bool:
 
 # ------------------------------------------------------------------ speed model for time-left estimates
 def load_speed():
-    d = {"analyse": 0.35, "transcribe": 0.25, "render": 6.0, "finish": 1.2}  # seconds per second of footage/output
+    d = {"analyse": 0.35, "transcribe": 0.12, "render": 6.0, "finish": 1.2}  # seconds per second of footage/output
     if SPEED_FILE.exists():
         try:
             d.update(json.loads(SPEED_FILE.read_text()))
@@ -122,6 +122,7 @@ class Job:
         self.eta = None
         self.result = None
         self.cancelled = False
+        self.skip_stage = False  # set from the site: "Skip listening"
         self.events = []
         self.weights = {}
         self.done_w = 0.0
@@ -165,7 +166,7 @@ class Job:
         self.events = self.events[-50:]
 
     def snapshot(self):
-        return {"id": self.id, "kind": self.kind, "state": self.state, "stage": self.stage, "note": self.note,
+        return {"id": self.id, "kind": self.kind, "state": self.state, "stage": self.stage, "stage_key": self.stage_key, "note": self.note,
                 "progress": round(self.progress, 4), "eta": self.eta, "error": self.error, "result": self.result}
 
 
@@ -218,6 +219,39 @@ def feed_copy(src):
             "bytes": vid.stat().st_size}
 
 
+WIDE_CROP = "scale=960:540:force_original_aspect_ratio=increase,crop=960:540:(iw-960)/2:(ih-540)*0.3"  # same frame, any source shape
+
+
+def grade_frame(p, t, preset, intensity=1.0, log_profile=None, width=960, wide=False):
+    """One frame of a source clip with the full colour pipeline (correction + look). Cached as a JPG."""
+    ff, _ = media.tools()
+    key = analyze.cache_key(p)
+    aj = analyze.CACHE / f"{key}.json"
+    a = json.loads(aj.read_text("utf-8")) if aj.exists() else {}
+    log = a.get("log") or {}
+    lut = grade.lut_for(log_profile=log_profile or (log.get("profile") if log.get("is_log") else None),
+                        correction=grade.correction_params(a.get("frames", [])) if a.get("frames") else None,
+                        preset_name=preset, intensity=float(intensity), transfer=None, theme_hex=None)
+    tag = json.dumps([p, round(t, 2), preset, round(float(intensity), 2), log_profile, width, wide])
+    out = HOME / "Projects" / "_thumbs" / f"grade_{hashlib.sha1(tag.encode()).hexdigest()[:12]}.jpg"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if not out.exists():
+        media.run([ff, "-y", "-v", "error", "-ss", f"{t:.2f}", "-i", p, "-vf",
+                   f"{WIDE_CROP if wide else f'scale={width}:-2'},lut3d=file='{render.fpath(lut)}'", "-frames:v", "1", "-q:v", "3", str(out)])
+    return out
+
+
+def raw_frame(p, t, width=960, wide=False):
+    """The frame exactly as the camera recorded it (for 'straight from camera')."""
+    ff, _ = media.tools()
+    out = HOME / "Projects" / "_thumbs" / f"raw_{hashlib.sha1(json.dumps([p, round(t, 2), width, wide]).encode()).hexdigest()[:12]}.jpg"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if not out.exists():
+        media.run([ff, "-y", "-v", "error", "-ss", f"{t:.2f}", "-i", p, "-vf", WIDE_CROP if wide else f"scale={width}:-2",
+                   "-frames:v", "1", "-q:v", "3", str(out)])
+    return out
+
+
 def export_name(event, fmt, version_dir):
     """EventCut_Team-Bonding_9x16_v3_2026-10-11: sorts by event, then shape, version and date."""
     words = re.sub(r"[^A-Za-z0-9 -]+", " ", event or "Event").split()
@@ -240,9 +274,13 @@ def run_generate(job: Job):
         sp = load_speed()
         formats = s.get("formats") or [s.get("format", "9:16")]
         dur = float(s.get("duration", 60))
-        want_words = (s.get("captions") or s.get("prompt")) and smart.whisper_available()
+        talk = story.template_for(s.get("event_type", "")) == "talk"
+        use_ai = talk and gemini.enabled() and s.get("google_ai", True)
+        # speech: needed for captions; for podcasts without Google AI it also gives exact sentence edges
+        want_words = (s.get("captions") or (talk and not use_ai) or (s.get("prompt") and not use_ai)) and smart.whisper_available()
         job.plan_stages({"analyse": 1 if cached else foot * sp["analyse"],
                          "transcribe": foot * sp["transcribe"] if want_words else 0,
+                         "ai": foot * 0.05 + 40 if use_ai else 0,
                          "director": 25 if s.get("director") else 0, "plan": 2,
                          **{f"render_{f}": dur * sp["render"] for f in formats},
                          **{f"finish_{f}": dur * sp["finish"] for f in formats}})
@@ -264,10 +302,48 @@ def run_generate(job: Job):
         if want_words:
             job.set_stage("transcribe", "Listening to speeches")
             t0 = time.time()
-            for i, a in enumerate(a for a in analyses if a["kind"] == "video" and a["info"].get("has_audio")):
-                transcripts[a["path"]] = smart.transcribe(a["path"], a["key"])
-                job.update(min(1, (i + 1) / len(analyses)))
-            update_speed("transcribe", (time.time() - t0) / foot)
+            speak = [a for a in analyses if a["kind"] == "video" and a["info"].get("has_audio")]
+            lens = [float(a["info"].get("duration") or 1) for a in speak]
+            for i, a in enumerate(speak):
+                if job.cancelled:
+                    raise InterruptedError
+                if job.skip_stage:
+                    break
+                before = sum(lens[:i])
+
+                def prog(f, note, i=i, before=before):
+                    if job.cancelled:
+                        raise InterruptedError
+                    if job.skip_stage:
+                        raise smart.Skipped
+                    job.update((before + f * lens[i]) / (sum(lens) or 1), f"Clip {i + 1} of {len(speak)}: {note}")
+                transcripts[a["path"]] = smart.transcribe(a["path"], analyze.proxy_key(a["path"]), prog)
+            if not job.skip_stage:
+                update_speed("transcribe", (time.time() - t0) / foot)
+            job.skip_stage = False
+        # 2b. Google AI picks the soundbites (podcasts, interviews, panels)
+        ai, ai_note = {}, None
+        if use_ai:
+            job.set_stage("ai", "Google AI is watching your footage")
+            speak = [a for a in analyses if a["kind"] == "video" and a["info"].get("has_audio")]
+            lens = [float(a["info"].get("duration") or 1) for a in speak]
+            try:
+                for i, a in enumerate(speak):
+                    if job.cancelled:
+                        raise InterruptedError
+                    before = sum(lens[:i])
+
+                    def prog(f, note="", i=i, before=before):
+                        if job.cancelled:
+                            raise InterruptedError
+                        job.update((before + f * lens[i]) / (sum(lens) or 1), f"Clip {i + 1} of {len(speak)}: {note}")
+                    r = gemini.analyse_clip(a["path"], s.get("event_type", ""), lens[i], analyze.proxy_key(a["path"]), prog)
+                    ai[a["path"]] = r
+                if not s.get("title") and s.get("ai_title") and ai:
+                    s["title"] = next(iter(ai.values())).get("title") or ""
+            except gemini.AIError as e:
+                ai, ai_note = {}, f"Google AI wasn't used ({e}). EventCut chose the moments itself."
+        s["_ai"] = ai
         # 3. director (optional)
         if s.get("director"):
             job.set_stage("director", "Director mode is choosing the story")
@@ -303,6 +379,11 @@ def run_generate(job: Job):
         else:
             grid = audio.music_grid(music["mood"], dur, seed)
         plan = p.get("plan") or story.plan_edit(analyses, s, grid, transcripts, taste)
+        s.pop("_ai", None)
+        if ai:
+            plan["ai"] = {"used": True, "cost_usd": round(sum(v.get("usd", 0) for v in ai.values()), 4)}
+        if ai_note:
+            plan["warning"] = (plan.get("warning") + " " if plan.get("warning") else "") + ai_note
         plan["music"] = {k: music.get(k) for k in ("path", "mood", "title", "creator", "license", "source")}
         job.update(1.0)
         # 5. render each format
@@ -558,13 +639,16 @@ class Handler(BaseHTTPRequestHandler):
             b = self.body()
             job = start_job(b.get("kind", "generate"), b, user)
             return self.send_json(job.snapshot())
-        m = re.match(r"^/jobs/([a-f0-9]+)(/cancel|/events)?$", path)
+        m = re.match(r"^/jobs/([a-f0-9]+)(/cancel|/events|/skip)?$", path)
         if m:
             job = JOBS.get(m.group(1))
             if not job:
                 return self.send_json({"error": "Job not found"}, 404)
             if m.group(2) == "/cancel":
                 job.cancelled = True
+                return self.send_json({"ok": True})
+            if m.group(2) == "/skip":
+                job.skip_stage = True  # stop listening, carry on with what was heard
                 return self.send_json({"ok": True})
             if m.group(2) == "/events":
                 return self.sse(job)
@@ -603,8 +687,29 @@ class Handler(BaseHTTPRequestHandler):
             dest.write_bytes(data)
             os.utime(dest, None)  # newest file = default logo
             return self.send_json({"path": str(dest), "name": dest.name})
+        if path == "/ai/estimate" and method == "POST":
+            paths = self.body().get("paths", [])
+            secs = sum(float(media.probe(p)["duration"] or 0) for p in paths if path_allowed(p) and os.path.isfile(p))
+            est = gemini.estimate(secs)
+            est.update(seconds=round(secs), enabled=gemini.enabled(), month_spend=round(gemini.month_spend(), 3), cap=gemini.cfg()["cap"])
+            return self.send_json(est)
+        if path == "/ai/test" and method == "POST":
+            key = (self.body().get("key") or gemini.cfg()["key"]).strip()
+            try:
+                return self.send_json({"ok": True, "model": gemini.test_key(key)})
+            except gemini.AIError as e:
+                return self.send_json({"ok": False, "error": str(e)}, 400)
         if path == "/feed-copy" and method == "POST":
-            return self.send_json(feed_copy(self.body().get("path", "")))
+            b = self.body()
+            res = feed_copy(b.get("path", ""))
+            src, t = b.get("frame_src"), b.get("frame_t")
+            if src and t is not None and path_allowed(src) and os.path.isfile(src):
+                looks = {"before": str(raw_frame(src, float(t), 960, wide=True))}
+                for name in grade.PRESETS:
+                    if name != "None":
+                        looks[name] = str(grade_frame(src, float(t), name, 1.0, width=960, wide=True))
+                res["looks"] = looks
+            return self.send_json(res)
         if path == "/music-preview" and method == "POST":
             b = self.body()
             out = audio.LIB / "_previews" / f"{re.sub('[^A-Za-z]', '', b.get('mood', 'x'))}.wav"
@@ -641,11 +746,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(est)
         if path == "/transcript" and method == "POST":
             b = self.body()
-            smart.save_transcript(analyze.cache_key(b["path"]), b["words"])
+            smart.save_transcript(analyze.proxy_key(b["path"]), b["words"])
             return self.send_json({"ok": True})
         if path == "/transcript":
             p = q.get("path", [""])[0]
-            f = smart.TRANS_CACHE / f"{analyze.cache_key(p)}.json"
+            f = smart.TRANS_CACHE / f"{analyze.proxy_key(p)}.json"
             return self.send_json({"words": json.loads(f.read_text("utf-8")) if f.exists() else []})
         if path == "/candidates":
             # alternative moments for swapping a clip in the review timeline
@@ -664,12 +769,16 @@ class Handler(BaseHTTPRequestHandler):
             cfg = load_settings()
             if method == "POST":
                 b = self.body()
-                for k in ("notify_sound", "notify_volume", "director_mode_api_key", "director_monthly_cap_usd", "director_mode_model"):
+                for k in ("notify_sound", "notify_volume", "director_mode_api_key", "director_monthly_cap_usd", "director_mode_model",
+                          "google_api_key", "google_model", "google_monthly_cap_usd", "use_google_ai", "google_prices"):
                     if k in b:
                         cfg[k] = b[k]
                 save_settings(cfg)
-            safe = {k: v for k, v in cfg.items() if k not in ("director_mode_api_key", "supabase_anon_key")}
+            safe = {k: v for k, v in cfg.items() if k not in ("director_mode_api_key", "supabase_anon_key", "google_api_key")}
             safe["director_key_set"] = bool(cfg.get("director_mode_api_key"))
+            safe["google_key_set"] = bool(cfg.get("google_api_key"))
+            safe["google_month_spend"] = round(gemini.month_spend(), 3)
+            safe["google_prices"] = {**gemini.DEFAULT_PRICES, **(cfg.get("google_prices") or {})}
             return self.send_json(safe)
         if path == "/brand-kit" and method == "POST":
             # Team Brand Kit sync: the site sends logos (SVG already rasterised to PNG in the browser), fonts and theme
@@ -793,20 +902,7 @@ class Handler(BaseHTTPRequestHandler):
         p = b.get("path")
         if not p or not path_allowed(p):
             return self.send_json({"error": "File not available"}, 404)
-        ff, _ = media.tools()
-        key = analyze.cache_key(p)
-        aj = analyze.CACHE / f"{key}.json"
-        frames = json.loads(aj.read_text("utf-8"))["frames"] if aj.exists() else []
-        log = (json.loads(aj.read_text("utf-8")).get("log") or {}) if aj.exists() else {}
-        lut = grade.lut_for(log_profile=b.get("log_profile") or (log.get("profile") if log.get("is_log") else None),
-                            correction=grade.correction_params(frames) if frames else None,
-                            preset_name=b.get("preset", "Vibrant Cinematic"), intensity=float(b.get("intensity", 1)),
-                            transfer=None, theme_hex=None)
-        out = HOME / "Projects" / "_thumbs" / f"grade_{hashlib.sha1(json.dumps(b, sort_keys=True).encode()).hexdigest()[:12]}.jpg"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        if not out.exists():
-            media.run([ff, "-y", "-v", "error", "-ss", f"{float(b.get('t', 1)):.2f}", "-i", p, "-vf",
-                       f"scale=960:-2,lut3d=file='{render.fpath(lut)}'", "-frames:v", "1", "-q:v", "3", str(out)])
+        out = grade_frame(p, float(b.get("t", 1)), b.get("preset", "Vibrant Cinematic"), float(b.get("intensity", 1)), b.get("log_profile"))
         data = out.read_bytes()
         self.send_response(200)
         self.cors()

@@ -115,6 +115,10 @@ def _moment_pool(analyses, terms, transcripts, taste, rng, randomness, director=
 
 def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
     """Return {sections, shots, total} where every shot length is a whole number of beats."""
+    if template_for(settings.get("event_type", "")) == "talk" and settings.get("talk_mode", True):
+        from . import talk
+        return talk.plan_talk(analyses, settings, grid, transcripts, settings.get("_ai"),
+                              source_order=source_order([a for a in analyses if a.get("kind") == "video"]))
     if settings.get("order", "chronological") == "chronological":
         return plan_chronological(analyses, settings, grid, transcripts, taste)
     transcripts = transcripts or {}

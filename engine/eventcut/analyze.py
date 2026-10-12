@@ -39,6 +39,12 @@ def _detect_faces(img):
 
 def cache_key(path: str) -> str:
     st = Path(path).stat()
+    return hashlib.sha1(f"{path}|{st.st_size}|{int(st.st_mtime)}|v8".encode()).hexdigest()[:16]
+
+
+def proxy_key(path: str) -> str:
+    """Working copies don't change between analysis versions, so they keep their name (no re-encoding 4K files)."""
+    st = Path(path).stat()
     return hashlib.sha1(f"{path}|{st.st_size}|{int(st.st_mtime)}|v6".encode()).hexdigest()[:16]
 
 
@@ -63,6 +69,7 @@ def _frame_metrics(frame, prev_gray, detect_faces):
     else:
         m["rgb"] = [m["luma"]] * 3
     m["fx"], m["fy"], m["focus"] = 0.5, 0.45, "centre"
+    diff = None
     if prev_gray is not None and prev_gray.shape == gray.shape:
         diff = np.abs(gray.astype(np.int16) - prev_gray.astype(np.int16))
         m["motion"] = float(diff.mean() / 255.0)
@@ -91,6 +98,19 @@ def _frame_metrics(frame, prev_gray, detect_faces):
             m["span"] = [float(min(fx for fx, _, _, _ in faces) / gray.shape[1]), float(max(fx + fw for fx, _, fw, _ in faces) / gray.shape[1]),
                          float(min(fy for _, fy, _, _ in faces) / gray.shape[0]), float(max(fy + fh for _, fy, _, fh in faces) / gray.shape[0])]
             m["fx"], m["fy"], m["focus"] = m["group_x"], m["group_y"], "faces"
+            # every face, for multi-person framing: centre x/y, width, height (0..1) and mouth movement,
+            # which tells who is talking (lower-face change minus upper-face change, so nodding doesn't count)
+            boxes = []
+            for fx, fy, fw, fh in faces:
+                mouth = 0.0
+                if diff is not None:
+                    lo = diff[fy + int(fh * 0.6): fy + fh, fx + fw // 5: fx + fw - fw // 5]
+                    up = diff[fy: fy + int(fh * 0.4), fx + fw // 5: fx + fw - fw // 5]
+                    if lo.size and up.size:
+                        mouth = float(lo.mean()) / (float(up.mean()) + 2.0)  # mouth change relative to the head's own movement
+                gw, gh = gray.shape[1], gray.shape[0]
+                boxes.append([round((fx + fw / 2) / gw, 4), round((fy + fh / 2) / gh, 4), round(fw / gw, 4), round(fh / gh, 4), round(mouth, 5)])
+            m["boxes"] = boxes
     return m, gray
 
 
@@ -123,7 +143,7 @@ def analyse_video(path: str, progress=None) -> dict:
     if out_json.exists():
         return json.loads(out_json.read_text("utf-8"))
     info = media.probe(path)
-    proxy = media.make_proxy(path, CACHE / f"{key}_proxy.mp4", fps=FPS)
+    proxy = media.make_proxy(path, CACHE / f"{proxy_key(path)}_proxy.mp4", fps=FPS)
     cap = cv2.VideoCapture(str(proxy))
     frames, prev, i = [], None, 0
     total = max(1, int(info["duration"] * FPS))
@@ -140,7 +160,7 @@ def analyse_video(path: str, progress=None) -> dict:
     # carry face data to the odd frames we skipped
     for j in range(1, len(frames)):
         if frames[j]["faces"] == 0 and frames[j - 1]["faces"] > 0 and j % 2 == 1:
-            for k in ("faces", "face_x", "face_y", "face_area", "skin_luma", "group_x", "group_y", "span", "fx", "fy", "focus"):
+            for k in ("faces", "face_x", "face_y", "face_area", "skin_luma", "group_x", "group_y", "span", "fx", "fy", "focus", "boxes"):
                 if k in frames[j - 1]:
                     frames[j][k] = frames[j - 1][k]
 
