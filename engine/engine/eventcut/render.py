@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import audio, grade, media
+from . import audio, fxtrans, grade, media
 from .config import HOME, tools
 
 FORMATS = {"9:16": (1080, 1920), "16:9": (1920, 1080), "1:1": (1080, 1080), "4:5": (1080, 1350)}
@@ -18,10 +18,23 @@ XFADE = {
     "whip_l": ("smoothleft", 0.24), "whip_r": ("smoothright", 0.24), "whip_u": ("smoothup", 0.24), "whip": ("smoothleft", 0.24),
     "blurwhip": ("hblur", 0.3), "slide_l": ("slideleft", 0.3), "zoom": ("zoomin", 0.32),
     "flash": ("fadewhite", 0.2), "dip": ("fadeblack", 0.4), "dissolve": ("fade", 0.5),
+    # camera-style moves drawn by fxtrans (built-in look used only if a shot is too short)
+    "tilt": ("zoomin", 0.6), "zoom_in": ("zoomin", 0.4), "zoom_out": ("fade", 0.5), "pan_l": ("smoothleft", 0.44), "pan_u": ("smoothup", 0.44),
 }
 # which sound family goes with each transition
+# Caption looks. size_v/size_h: font size as a share of the short side for tall/wide videos.
+CAPTION_STYLES = {
+    "bold":    {"font": "Poppins", "bold": True, "upper": True, "size_v": 0.12, "size_h": 0.08, "outline": 0.075, "shadow": 0, "border": 1, "words": 3, "max_s": 2.2, "highlight": True},
+    "clean":   {"font": "Poppins Medium", "bold": False, "upper": False, "size_v": 0.085, "size_h": 0.06, "outline": 0.04, "shadow": 2, "border": 1, "words": 5, "max_s": 2.8, "highlight": False},
+    "boxed":   {"font": "Poppins", "bold": True, "upper": False, "size_v": 0.085, "size_h": 0.058, "outline": 0.16, "shadow": 0, "border": 3, "words": 4, "max_s": 2.6, "highlight": True, "outline_col": "&H40000000"},
+    "karaoke": {"font": "Poppins", "bold": True, "upper": True, "size_v": 0.105, "size_h": 0.072, "outline": 0.07, "shadow": 0, "border": 1, "words": 4, "max_s": 2.6, "highlight": True},
+    "neon":    {"font": "Poppins", "bold": True, "upper": True, "size_v": 0.11, "size_h": 0.075, "outline": 0.05, "shadow": 0, "border": 1, "words": 3, "max_s": 2.2, "highlight": True, "blur": 2},
+    "minimal": {"font": "Poppins Medium", "bold": False, "upper": False, "size_v": 0.06, "size_h": 0.045, "outline": 0.0, "shadow": 2, "border": 1, "words": 7, "max_s": 3.2, "highlight": False},
+}
+
 TRANS_SFX = {"whip_l": "whoosh", "whip_r": "whoosh", "whip_u": "whoosh", "whip": "whoosh", "blurwhip": "whoosh",
-             "slide_l": "whoosh", "zoom": "impact", "flash": "impact", "dip": "reverse", "dissolve": None}
+             "slide_l": "whoosh", "zoom": "impact", "flash": "impact", "dip": "reverse", "dissolve": None,
+             "tilt": "whoosh", "zoom_in": "whoosh", "zoom_out": "reverse", "pan_l": "whoosh", "pan_u": "whoosh"}
 
 
 def _font(name="Poppins-Bold.ttf"):
@@ -58,6 +71,44 @@ def _ass_color(h, alpha=0):
         h = "".join(c * 2 for c in h)
     r, g, b = h[0:2], h[2:4], h[4:6]
     return f"&H{alpha:02X}{b}{g}{r}".upper()
+
+
+LOGO_EXT = {".png", ".webp", ".gif", ".mov", ".webm", ".jpg", ".jpeg"}
+
+
+def logo_bytes_ok(data: bytes, name: str) -> bool:
+    """True when the bytes really are a logo FFmpeg can place (not an error page saved as .png)."""
+    ext = Path(name).suffix.lower()
+    if ext not in LOGO_EXT or len(data) < 32:
+        return False
+    if ext == ".gif":
+        return data[:4] == b"GIF8"
+    if ext == ".mov":
+        return b"ftyp" in data[:16] or b"moov" in data[:4096] or b"mdat" in data[:4096] or b"wide" in data[:16]
+    if ext == ".webm":
+        return data[:4] == b"\x1a\x45\xdf\xa3"
+    try:
+        import cv2
+        img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
+        return img is not None and img.size > 0
+    except Exception:
+        # no decoder available: fall back to signatures
+        return data[:8] == b"\x89PNG\r\n\x1a\n" or data[:3] == b"\xff\xd8\xff" or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+
+
+_logo_checked = {}
+
+
+def logo_path_ok(p: Path) -> bool:
+    try:
+        key = (str(p), p.stat().st_mtime, p.stat().st_size)
+        if key not in _logo_checked:
+            with open(p, "rb") as f:
+                head = f.read(8192) if p.suffix.lower() in (".mov", ".webm", ".gif") else f.read()
+            _logo_checked[key] = logo_bytes_ok(head, p.name)
+        return _logo_checked[key]
+    except OSError:
+        return False
 
 
 def fx_leak(work: Path, style: int = 0) -> Path:
@@ -182,28 +233,29 @@ class Renderer:
             vf.append(f"scale={int(sw * z * 1.1) // 2 * 2}:-2")
             vf.append(f"zoompan=z='min(1+0.10*on/{frames},1.10)':x='({fx}*iw-iw/zoom/2)*(1-0)+0*on':y='ih/2-ih/zoom/2':d={frames}:s={W}x{H}:fps={self.fps}")
         else:
-            args += ["-ss", f"{shot['in']:.3f}", "-t", f"{length:.3f}", "-i", src]
+            args += media.decode_args() + ["-ss", f"{shot['in']:.3f}", "-t", f"{length:.3f}", "-i", src]
             if media.is_hdr(info):
                 vf.append("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
             sw, sh = info.get("width", W), info.get("height", H)
             # slow-motion for high-frame-rate clips in emotional/close sections
             src_fps = float(info.get("fps") or 25)
-            slow = shot["section"] in ("emotional", "close") and src_fps >= 48 and not self.preview
+            slow = shot["section"] in ("emotional", "close") and src_fps >= 48 and not self.preview and not shot.get("layouts")
             if slow:
                 factor = min(2.0, src_fps / self.fps)
                 args[args.index("-t") + 1] = f"{length / factor:.3f}"
                 vf.append(f"setpts={factor:.3f}*PTS")
             m = a.get("moments", [{}])[shot.get("moment", 0)] if a.get("moments") else {}
-            if 0.012 < m.get("shake", 0) <= 0.035 and not self.preview:
-                vf.append("deshake=rx=32:ry=32")
             vf += self.framing(shot, a, sw, sh, length)
+            if 0.012 < m.get("shake", 0) <= 0.035 and not self.preview:
+                # stabilise after the reframe: same result, far less work on 4K footage
+                vf.append("deshake=rx=32:ry=32")
             vf.append(f"fps={self.fps}")
         vf.append(f"lut3d=file='{fpath(lut)}'")
         if self.s.get("preset", "Vibrant Cinematic") in ("Vibrant Cinematic", "Cinematic Teal & Orange", "Warm Celebration") and not self.preview:
             # soft highlight glow (halation) for the cinematic look
             # computed at quarter resolution for speed
             vf.append(f"split[a][b];[b]scale={W // 4}:{H // 4},gblur=sigma={max(3, W // 360)},curves=all='0/0 0.7/0.05 1/0.8',scale={W}:{H}[g];[a][g]blend=all_mode=screen:all_opacity=0.22")
-        if self.s.get("grain", True) and not self.preview:
+        if self.s.get("grain", True) and not self.preview and self.s.get("preset") != "None":
             vf.append("noise=alls=3:allf=t")
         vf += ["setsar=1", "format=yuv420p", f"trim=duration={length:.3f}", "setpts=PTS-STARTPTS"]
         has_audio = shot["kind"] != "photo" and info.get("has_audio")
@@ -215,7 +267,7 @@ class Renderer:
                      "-filter_complex", f"[0:v]{','.join(vf)}[v]", "-map", "[v]", "-map", "1:a"]
         args += ["-r", str(self.fps)] + media.intermediate_args()
         args += ["-c:a", "pcm_s16le", "-t", f"{length:.3f}", str(out.with_suffix(".mov"))]
-        media.run(args)
+        media.run_decoding(args)
         return out.with_suffix(".mov")
 
     # ------------------------------------------------------------- framing
@@ -244,6 +296,12 @@ class Renderer:
           over a blurred, enlarged copy of itself, the way broadcast editors handle phone video."""
         W, H = self.W, self.H
         mode = self.s.get("framing", "auto")
+        if shot.get("layouts") and mode == "auto":
+            lay = shot["layouts"].get("v" if H / W > 1.05 or abs(H - W) < 4 else "h")
+            if lay:
+                return self.layout_filters(lay, sw, sh)
+            if W / H > 1.3 and sw / sh > 1.3:  # landscape into landscape: the full wide shot
+                return [f"scale={W}:{H}:force_original_aspect_ratio=increase:flags=lanczos", f"crop={W}:{H}", f"fps={self.fps}"]
         src_ar, dst_ar = sw / sh, W / H
         p0, p1, span = self.focus_track(shot, a, length)
         scale = max(W / sw, H / sh)
@@ -277,6 +335,53 @@ class Renderer:
             z = 0.05 + 0.05 * rng.random()
             out += [f"scale=w='trunc({W}*(1+{z:.3f}*t/{length:.3f})/2)*2':h=-2:eval=frame:flags=bicubic", f"crop={W}:{H}"]
         return out
+
+    def _face_crop(self, box, sw, sh, out_w, out_h, face_frac, eye_line):
+        """Crop (x, y, w, h) in source pixels around one face, at the output's shape, the face filling face_frac
+        of the width and its centre eye_line of the way down (headroom like a camera operator would leave)."""
+        cx, cy, fw = box[0] * sw, box[1] * sh, max(box[2] * sw, 8)
+        ar = out_w / out_h
+        cw = fw / face_frac
+        cw = max(cw, out_w / 2.2, fw * 1.9)          # never enlarge a small image more than 2.2x
+        ch = cw / ar
+        if ch > sh:
+            ch, cw = sh, sh * ar
+        if cw > sw:
+            cw, ch = sw, sw / ar
+        x = min(max(0.0, cx - cw / 2), sw - cw)
+        y = min(max(0.0, cy - ch * eye_line), sh - ch)
+        return int(x) // 2 * 2, int(y) // 2 * 2, int(cw) // 2 * 2, int(ch) // 2 * 2
+
+    def layout_filters(self, lay, sw, sh):
+        """Podcast framings: the speaker in close-up, all hosts stacked, a punch-in, or the wide shot."""
+        W, H, fps = self.W, self.H, f"fps={self.fps}"
+        mode = lay.get("mode")
+        if mode == "speaker":
+            x, y, cw, ch = self._face_crop(lay["box"], sw, sh, W, H, 0.36 if H > W else 0.22, 0.34)
+            return [f"crop={cw}:{ch}:{x}:{y}", f"scale={W}:{H}:flags=lanczos", fps]
+        if mode == "punch":
+            cw = sw / 1.45
+            x, y, cw, ch = self._face_crop(lay["box"], sw, sh, W, H, max(0.08, lay["box"][2] * sw / cw), 0.40)
+            return [f"crop={cw}:{ch}:{x}:{y}", f"scale={W}:{H}:flags=lanczos", fps]
+        if mode == "stack":
+            boxes = sorted(lay["boxes"], key=lambda b: b[0])[:3]
+            n = len(boxes)
+            hs = [H // n // 2 * 2] * (n - 1)
+            hs.append(H - sum(hs))
+            parts = [f"split={n}" + "".join(f"[s{i}]" for i in range(n))]
+            for i, (b, ph) in enumerate(zip(boxes, hs)):
+                x, y, cw, ch = self._face_crop(b, sw, sh, W, ph, 0.24, 0.45)
+                parts.append(f"[s{i}]crop={cw}:{ch}:{x}:{y},scale={W}:{ph}:flags=lanczos,setsar=1[t{i}]")
+            chain = ";".join(parts) + ";" + "".join(f"[t{i}]" for i in range(n)) + f"vstack=inputs={n}"
+            lines = ",".join(f"drawbox=x=0:y={sum(hs[:i + 1]) - 3}:w={W}:h=6:color=black@0.85:t=fill" for i in range(n - 1))
+            return [chain + ("," + lines if lines else ""), fps]
+        # wide: whole frame over a blurred copy (tall outputs) or simply scaled (wide outputs)
+        if W / H > 1.3:
+            return [f"scale={W}:{H}:force_original_aspect_ratio=increase:flags=lanczos", f"crop={W}:{H}", fps]
+        return [f"split=2[bga][fga];[bga]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
+                f"gblur=sigma={max(20, W // 40)},eq=brightness=-0.10:saturation=1.15[bgb];"
+                f"[fga]scale={W}:{H}:force_original_aspect_ratio=decrease:flags=lanczos[fgb];"
+                f"[bgb][fgb]overlay=(W-w)/2:(H-h)/2", fps]
 
     # ------------------------------------------------------------- assembly
     def assemble(self, files):
@@ -312,9 +417,27 @@ class Renderer:
         for k in range(1, len(run_files)):
             trans = runs[k][0][1]["transition"]
             kind, d = XFADE[trans]
+            made = None
+            if trans in fxtrans.CUSTOM:
+                dd = fxtrans.frames_for(d, self.fps) / self.fps
+                if lengths[k - 1] >= 2 * dd + 0.1 and lengths[k] >= 2 * dd + 0.1:
+                    try:
+                        made, _ = fxtrans.make(trans, self.ffmpeg, run_files[k - 1], lengths[k - 1], run_files[k], self.W, self.H, self.fps,
+                                               self.work / f"trans_{k}.mov", seed=int(self.s.get("seed") or 0) + k)
+                        d = dd
+                    except Exception:
+                        made = None
             offset -= d
-            fc.append(f"[{prev_v}][n{k}]xfade=transition={kind}:duration={d}:offset={offset:.3f}[v{k}]")
-            fc.append(f"[{prev_a}][m{k}]acrossfade=d={d}:c1=tri:c2=tri[a{k}]")
+            if made:
+                ti = len(inputs) // 2
+                inputs += ["-i", str(made)]
+                fc.append(f"[{ti}:v]fps={self.fps},format=yuv420p,setsar=1,settb=AVTB,setpts=PTS-STARTPTS[tt{k}]")
+                fc.append(f"[{prev_v}]trim=duration={offset:.4f},setpts=PTS-STARTPTS[pa{k}]")
+                fc.append(f"[n{k}]trim=start={d:.4f},setpts=PTS-STARTPTS[nb{k}]")
+                fc.append(f"[pa{k}][tt{k}][nb{k}]concat=n=3:v=1:a=0[v{k}]")
+            else:
+                fc.append(f"[{prev_v}][n{k}]xfade=transition={kind}:duration={d}:offset={offset:.3f}[v{k}]")
+            fc.append(f"[{prev_a}][m{k}]acrossfade=d={d:.4f}:c1=tri:c2=tri[a{k}]")
             prev_v, prev_a = f"v{k}", f"a{k}"
             offset += lengths[k]
         out = self.work / "body.mov"
@@ -324,14 +447,16 @@ class Renderer:
 
     # ------------------------------------------------------------- graphics
     def logo_file(self):
-        """The chosen logo, else the most recently added one in Assets/Logos (images or animated logos)."""
+        """The chosen logo, else the most recently added readable one in Assets/Logos (images or animated logos)."""
         logo = self.s.get("logo")
-        if logo and Path(logo).exists():
+        if logo and Path(logo).is_file() and logo_path_ok(Path(logo)):
             return Path(logo)
         folder = HOME / "Assets" / "Logos"
-        ok = {".png", ".webp", ".gif", ".mov", ".webm", ".jpg", ".jpeg"}
-        files = [f for f in folder.glob("*") if f.is_file() and f.suffix.lower() in ok] if folder.exists() else []
-        return max(files, key=lambda f: f.stat().st_mtime) if files else None
+        files = [f for f in folder.glob("*") if f.is_file() and f.suffix.lower() in LOGO_EXT] if folder.exists() else []
+        for f in sorted(files, key=lambda f: f.stat().st_mtime, reverse=True):
+            if logo_path_ok(f):
+                return f
+        return None
 
     def logo_overlay(self, idx, base_label, out_label):
         """Filter text that places the logo input #idx as a corner watermark."""
@@ -375,16 +500,42 @@ class Renderer:
         return out
 
     def captions_ass(self, words_timeline):
-        """Bold, theme-coloured, word-by-word highlighted captions inside platform safe zones."""
+        """Captions in one of several styles, kept inside the platform safe zones.
+
+        Styles: bold (word pops in the accent colour), clean, boxed, karaoke (words fill as spoken),
+        neon (glowing accent text) and minimal (small lower-third subtitles)."""
         W, H = self.W, self.H
-        fs = int(min(W, H) * (0.13 if H > W else 0.085))
-        margin_v = int(H * (0.24 if H > W else 0.08))  # stay above TikTok/Reels bottom UI
-        hl = _ass_color(self.accent)
-        style = (f"Style: Cap,Poppins,{fs},&H00FFFFFF,{hl},&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,{max(2, fs // 14)},0,2,"
-                 f"{int(W * 0.08)},{int(W * 0.08)},{margin_v},1")
+        tall = H > W
+        name = self.s.get("caption_style", "bold")
+        cfg = CAPTION_STYLES.get(name, CAPTION_STYLES["bold"])
+        size = {"small": 0.82, "medium": 1.0, "large": 1.2}.get(self.s.get("caption_size", "medium"), 1.0)
+        fs = int(min(W, H) * (cfg["size_v"] if tall else cfg["size_h"]) * size)
+        pos = self.s.get("caption_position", "bottom")
+        align = {"top": 8, "middle": 5}.get(pos, 2)
+        if pos == "top":
+            margin_v = int(H * (0.14 if tall else 0.07))  # below the platform's top bar
+        elif pos == "middle":
+            margin_v = 0
+        else:
+            margin_v = int(H * (0.24 if tall else 0.08))  # above TikTok/Reels/Shorts buttons and captions
+        accent = self.s.get("caption_color") or self.accent
+        acc = _ass_color(accent)
+        white = "&H00FFFFFF"
+        upper = cfg["upper"]
+        font = cfg["font"]
+        bold = -1 if cfg["bold"] else 0
+        outline, shadow, border = max(1, int(fs * cfg["outline"])), cfg["shadow"], cfg["border"]
+        primary = acc if name == "neon" else white
+        outline_col = cfg.get("outline_col") or "&H00000000"
+        if name == "neon":
+            outline_col = _ass_color(accent, 0x30)
+        style = (f"Style: Cap,{font},{fs},{primary},{acc},{outline_col},&H64000000,{bold},0,0,0,100,100,{cfg.get('spacing', 0)},0,"
+                 f"{border},{outline},{shadow},{align},{int(W * 0.08)},{int(W * 0.08)},{margin_v},1")
+        per_line = cfg["words"] if tall else cfg["words"] + 2
         lines, cur = [], []
         for w in words_timeline:
-            if cur and (len(cur) >= 4 or w["start"] - cur[-1]["end"] > 0.6 or w["start"] - cur[0]["start"] > 2.2):
+            if cur and (len(cur) >= per_line or w["start"] - cur[-1]["end"] > 0.6 or w["start"] - cur[0]["start"] > cfg["max_s"]
+                        or cur[-1]["word"].strip()[-1:] in ".?!"):
                 lines.append(cur)
                 cur = []
             cur.append(w)
@@ -394,18 +545,43 @@ class Renderer:
         def ts(t):
             t = max(0, t)
             return f"{int(t // 3600)}:{int(t % 3600 // 60):02d}:{t % 60:05.2f}"
+
+        def word(t):
+            t = t.strip()
+            return t.upper() if upper else t
         ev = []
         for ln in lines:
-            # one event per word: the whole line in white, the word being spoken in the accent colour
-            for k, w in enumerate(ln):
-                start = w["start"]
-                end = ln[k + 1]["start"] if k + 1 < len(ln) else ln[-1]["end"] + 0.15
+            end_all = ln[-1]["end"] + 0.15
+            if name == "karaoke":
+                # one event per line; each word fills from white to the accent colour as it is spoken
                 parts = []
-                for j, ww in enumerate(ln):
-                    t = ww["word"].strip().upper()
-                    parts.append(f"{{\\1c{_ass_color(self.accent)}&\\fscx106\\fscy106}}{t}{{\\1c&H00FFFFFF&\\fscx100\\fscy100}}" if j == k else t)
-                fade = "{\\fad(80,0)}" if k == 0 else ""
-                ev.append(f"Dialogue: 0,{ts(start)},{ts(end)},Cap,,0,0,0,,{fade}{' '.join(parts)}")
+                for k, w in enumerate(ln):
+                    nxt = ln[k + 1]["start"] if k + 1 < len(ln) else w["end"]
+                    parts.append(f"{{\\kf{max(1, int(round((nxt - w['start']) * 100)))}}}{word(w['word'])}")
+                ev.append(f"Dialogue: 0,{ts(ln[0]['start'])},{ts(end_all)},Cap,,0,0,0,,{{\\1c{acc}&\\2c{white}&\\fad(60,60)}}" + " ".join(parts))
+                continue
+            if not cfg["highlight"]:
+                ev.append(f"Dialogue: 0,{ts(ln[0]['start'])},{ts(end_all)},Cap,,0,0,0,,{{\\fad(100,80)}}" + " ".join(word(w["word"]) for w in ln))
+                continue
+            for k, w in enumerate(ln):  # one event per word: the line, with the spoken word highlighted
+                start = w["start"]
+                end = ln[k + 1]["start"] if k + 1 < len(ln) else end_all
+                parts = []
+                for j2, ww in enumerate(ln):
+                    t = word(ww["word"])
+                    if j2 == k:
+                        if name == "boxed":
+                            parts.append(f"{{\\1c{acc}&}}{t}{{\\1c{white}&}}")
+                        elif name == "neon":
+                            parts.append(f"{{\\1c{white}&\\blur1}}{t}{{\\1c{acc}&\\blur{cfg.get('blur', 0)}}}")
+                        else:
+                            parts.append(f"{{\\1c{acc}&\\fscx108\\fscy108}}{t}{{\\1c{white}&\\fscx100\\fscy100}}")
+                    else:
+                        parts.append(t)
+                fx = "{\\fad(80,0)}" if k == 0 else ""
+                if cfg.get("blur"):
+                    fx += f"{{\\blur{cfg['blur']}}}"
+                ev.append(f"Dialogue: 0,{ts(start)},{ts(end)},Cap,,0,0,0,,{fx}{' '.join(parts)}")
         txt = ("[Script Info]\nScriptType: v4.00+\nPlayResX: %d\nPlayResY: %d\nWrapStyle: 0\n\n[V4+ Styles]\n"
                "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
                "%s\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n%s\n") % (W, H, style, "\n".join(ev))
@@ -592,8 +768,10 @@ class Renderer:
         body_len = float(media.probe(str(body))["duration"])
         self.progress("assemble", 1.0)
         end = None
-        if self.s.get("end_card", True):
+        if self.s.get("end_card", True) and self.s.get("ending") != "none":
             end_len = max(1.5, float(self.s.get("duration", 60)) - body_len)
+            if self.plan.get("shortened"):  # not enough footage: keep a normal end card, don't stretch it
+                end_len = max(1.5, float(self.plan.get("end_card") or 2.5))
             end = self.end_card(end_len)
         captions = None
         if self.s.get("captions") and transcripts:
@@ -650,11 +828,11 @@ class Renderer:
             return out
         wants = set(self.s.get("exports") or ["video", "video_only", "audio", "thumbnail"])
         if "video_only" in wants:
-            p = Path(f"{stem} (video only).mp4")
+            p = Path(f"{stem}_video-only.mp4")
             media.run([self.ffmpeg, "-y", "-v", "error", "-i", str(full), "-map", "0:v", "-c", "copy", "-movflags", "+faststart", str(p)])
             out["video_only"] = str(p)
         if "audio" in wants:
-            pw, pm = Path(f"{stem} (audio).wav"), Path(f"{stem} (audio).mp3")
+            pw, pm = Path(f"{stem}_audio.wav"), Path(f"{stem}_audio.mp3")
             shutil.copy(mix, pw)
             media.run([self.ffmpeg, "-y", "-v", "error", "-i", str(mix), "-c:a", "libmp3lame", "-b:a", "320k", str(pm)])
             out["audio_wav"], out["audio_mp3"] = str(pw), str(pm)
@@ -667,7 +845,7 @@ class Renderer:
         used = [p for p in [(self.s.get("music") or {}).get("path")] + list(getattr(self, "used_sfx", [])) if p]
         credits = audio.credits_for(used)
         if credits:
-            cf = Path(f"{stem} (music credits).txt")
+            cf = Path(f"{stem}_music-credits.txt")
             cf.write_text("Music and sound credits (please include these in the post caption or description):\n" + credits + "\n", "utf-8")
             out["credits"] = str(cf)
         if (self.s.get("music") or {}).get("title"):
@@ -683,7 +861,7 @@ class Renderer:
             if sc > best_s and s["length"] >= 0.4:
                 best_s, best_t = sc, t + s["length"] / 2
             t += s["length"]
-        p = Path(str(video).replace(".mp4", " (thumbnail).jpg"))
+        p = Path(str(video)[:-4] + "_thumbnail.jpg")
         vf = "scale=iw:ih"
         title = self.s.get("title")
         if title:

@@ -92,6 +92,28 @@ def is_hdr(info: dict) -> bool:
     return info.get("color_transfer") in ("arib-std-b67", "smpte2084")
 
 
+_HWDEC = {"ok": True}
+
+
+def decode_args() -> list:
+    """Let the graphics chip decode 4K/HEVC footage (much faster than the processor). Off again if it ever fails."""
+    return ["-hwaccel", "auto"] if _HWDEC["ok"] else []
+
+
+def run_decoding(cmd: list):
+    """Run an FFmpeg command that uses decode_args(); retry on the processor if hardware decoding fails."""
+    try:
+        return run(cmd)
+    except RuntimeError:
+        if "-hwaccel" not in cmd:
+            raise
+        i = cmd.index("-hwaccel")
+        plain = cmd[:i] + cmd[i + 2:]
+        r = run(plain)
+        _HWDEC["ok"] = False  # this PC's decoder had trouble: stay on the processor for this session
+        return r
+
+
 def make_proxy(src: str, dst: Path, height: int = 360, fps: int = 10) -> Path:
     """Small, fast working copy used for analysis and preview."""
     if dst.exists() and dst.stat().st_size > 0:
@@ -101,10 +123,10 @@ def make_proxy(src: str, dst: Path, height: int = 360, fps: int = 10) -> Path:
     vf = [f"fps={fps}", f"scale=-2:{height}:flags=fast_bilinear"]
     if is_hdr(info):
         vf.insert(0, "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
-    cmd = [ffmpeg, "-y", "-v", "error", "-i", src, "-vf", ",".join(vf), "-an",
+    cmd = [ffmpeg, "-y", "-v", "error"] + decode_args() + ["-i", src, "-vf", ",".join(vf), "-an",
            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", str(dst)]
     try:
-        run(cmd)
+        run_decoding(cmd)
     except RuntimeError:
         if is_hdr(info):  # zscale missing: fall back to plain scaling
             run([ffmpeg, "-y", "-v", "error", "-i", src, "-vf", f"fps={fps},scale=-2:{height}", "-an",

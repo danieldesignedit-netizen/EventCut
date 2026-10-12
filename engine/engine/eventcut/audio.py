@@ -40,7 +40,7 @@ def detect_beats(path: str) -> dict:
     # parabolic refinement for sub-frame tempo accuracy
     if 1 <= lag < len(ac) - 1:
         a0, a1, a2 = ac[lag - 1], ac[lag], ac[lag + 1]
-        lagf = lag + 0.5 * (a0 - a2) / (a0 - 2 * a1 + a2 + 1e-12)
+        lagf = float(lag + 0.5 * (a0 - a2) / (a0 - 2 * a1 + a2 + 1e-12))
     else:
         lagf = float(lag)
     period = lag
@@ -52,7 +52,7 @@ def detect_beats(path: str) -> dict:
     strengths = [flux[bidx[k::4]].sum() for k in range(4)]
     db = int(np.argmax(strengths))
     rms = np.sqrt(signal.convolve(y ** 2, np.ones(sr) / sr, mode="same")[::sr // 4])
-    out = {"bpm": round(60 * fps / lagf, 1), "beats": [round(float(b), 3) for b in beats],
+    out = {"bpm": round(float(60 * fps / lagf), 1), "beats": [round(float(b), 3) for b in beats],
            "downbeats": [round(float(b), 3) for b in beats[db::4]],
            "energy": [round(float(x), 4) for x in rms / (rms.max() + 1e-9)], "energy_rate": 4,
            "duration": round(len(y) / sr, 2)}
@@ -134,6 +134,8 @@ MOODS = {
     "Upbeat Afro House": {"bpm": 120, "root": 45, "prog": [(0, "m"), (8, "M"), (3, "M"), (10, "M")], "swing": 0.12, "perc": "afro", "family": "upbeat"},
     "Afrobeats Groove": {"bpm": 104, "root": 44, "prog": [(0, "m"), (5, "m"), (10, "M"), (3, "M")], "swing": 0.18, "perc": "afro", "family": "upbeat"},
     "Amapiano Glow": {"bpm": 112, "root": 41, "prog": [(0, "M"), (9, "m"), (4, "m"), (5, "M")], "swing": 0.1, "perc": "amapiano", "family": "upbeat"},
+    "Amapiano Sunset": {"bpm": 113, "root": 44, "prog": [(0, "m"), (5, "m"), (10, "M"), (8, "M")], "swing": 0.14, "perc": "amapiano", "family": "upbeat"},
+    "Amapiano Jazz Night": {"bpm": 110, "root": 39, "prog": [(0, "m"), (3, "M"), (8, "M"), (7, "M")], "swing": 0.16, "perc": "amapiano", "family": "upbeat"},
     "Dance Pop Lift": {"bpm": 124, "root": 47, "prog": [(0, "m"), (8, "M"), (10, "M"), (5, "m")], "swing": 0.0, "perc": "pop", "family": "upbeat"},
     "Cinematic Night": {"bpm": 96, "root": 38, "prog": [(0, "m"), (5, "m"), (8, "M"), (7, "M")], "swing": 0.0, "perc": "cinematic", "family": "cinematic"},
     "Epic Rise": {"bpm": 90, "root": 40, "prog": [(0, "m"), (8, "M"), (3, "M"), (10, "M")], "swing": 0.0, "perc": "cinematic", "family": "cinematic"},
@@ -489,13 +491,66 @@ def _http_json(url):
         return json.loads(r.read())
 
 
+# Genres the open library barely tags get searched with close relatives too
+RELATED = {
+    "amapiano": ["amapiano", "log drum", "afro house", "south african house", "deep house", "afrobeat"],
+    "afrobeat": ["afrobeat", "afrobeats", "afro", "african", "highlife", "afro house"],
+    "hip hop": ["hip hop", "hiphop", "rap beat", "boom bap", "trap"],
+    "party": ["party", "dance", "club", "edm", "house music"],
+    "emotional piano": ["emotional piano", "piano", "sad piano", "sentimental"],
+}
+
+
+def originals_for(q: str) -> list:
+    """EventCut's own styles that match a search word (always available, made to fit each video)."""
+    ql = (q or "").lower().strip()
+    if not ql:
+        return []
+    words = {"afrobeat": "Afro", "afro": "Afro", "party": "upbeat", "upbeat": "upbeat", "dance": "upbeat", "hip hop": "upbeat",
+             "inspiring": "corporate", "corporate": "corporate", "cinematic": "cinematic", "epic": "cinematic",
+             "chill": "chill", "lofi": "chill", "emotional piano": "emotional", "emotional": "emotional", "piano": "emotional"}
+    out = []
+    for name, cfg in MOODS.items():
+        key = words.get(ql)
+        if ql in name.lower() or (key and (key == cfg["family"] or key.lower() in name.lower())):
+            out.append({"name": name, "bpm": cfg["bpm"], "family": cfg["family"]})
+    return out
+
+
+def _openverse(q, category, page, page_size):
+    from urllib.parse import urlencode
+    params = {"q": q, "category": category, "license": "cc0,by", "page": max(1, int(page)), "page_size": min(20, int(page_size))}
+    return _http_json(OPENVERSE + "?" + urlencode(params))
+
+
 def search_online(q: str = "", category: str = "music", page: int = 1, page_size: int = 20) -> dict:
     """Search openly licensed audio that can be used commercially and edited (CC0 and CC BY only:
     share-alike licences would force the whole company video under the same licence)."""
-    from urllib.parse import urlencode
-    params = {"q": q or ("music" if category == "music" else "sound effect"), "category": category,
-              "license": "cc0,by", "page": max(1, int(page)), "page_size": min(20, int(page_size))}
-    data = _http_json(OPENVERSE + "?" + urlencode(params))
+    q = q or ("music" if category == "music" else "sound effect")
+    page = max(1, int(page))
+    data = _openverse(q, category, page, page_size)
+    raw = list(data.get("results", []))
+    count, pages = data.get("result_count", 0), data.get("page_count", 1)
+    related = RELATED.get(q.lower().strip(), []) if category == "music" else []
+    if related and len(raw) < 12:
+        seen = {r.get("id") for r in raw}
+        for alt in related:
+            if alt == q.lower():
+                continue
+            try:
+                d2 = _openverse(alt, category, page, 10)
+            except Exception:
+                continue
+            for r in d2.get("results", []):
+                if r.get("id") not in seen:
+                    seen.add(r.get("id"))
+                    raw.append(r)
+            count += d2.get("result_count", 0)
+            pages = max(pages, d2.get("page_count", 1))
+            if len(raw) >= 30:
+                break
+    data = {"results": raw, "result_count": count, "page_count": pages}
+    params = {"page": page}
     items = []
     for r in data.get("results", []):
         if not r.get("url"):

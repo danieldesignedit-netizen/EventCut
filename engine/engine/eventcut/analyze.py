@@ -39,7 +39,13 @@ def _detect_faces(img):
 
 def cache_key(path: str) -> str:
     st = Path(path).stat()
-    return hashlib.sha1(f"{path}|{st.st_size}|{int(st.st_mtime)}|v5".encode()).hexdigest()[:16]
+    return hashlib.sha1(f"{path}|{st.st_size}|{int(st.st_mtime)}|v8".encode()).hexdigest()[:16]
+
+
+def proxy_key(path: str) -> str:
+    """Working copies don't change between analysis versions, so they keep their name (no re-encoding 4K files)."""
+    st = Path(path).stat()
+    return hashlib.sha1(f"{path}|{st.st_size}|{int(st.st_mtime)}|v6".encode()).hexdigest()[:16]
 
 
 def _frame_metrics(frame, prev_gray, detect_faces):
@@ -63,6 +69,7 @@ def _frame_metrics(frame, prev_gray, detect_faces):
     else:
         m["rgb"] = [m["luma"]] * 3
     m["fx"], m["fy"], m["focus"] = 0.5, 0.45, "centre"
+    diff = None
     if prev_gray is not None and prev_gray.shape == gray.shape:
         diff = np.abs(gray.astype(np.int16) - prev_gray.astype(np.int16))
         m["motion"] = float(diff.mean() / 255.0)
@@ -91,6 +98,19 @@ def _frame_metrics(frame, prev_gray, detect_faces):
             m["span"] = [float(min(fx for fx, _, _, _ in faces) / gray.shape[1]), float(max(fx + fw for fx, _, fw, _ in faces) / gray.shape[1]),
                          float(min(fy for _, fy, _, _ in faces) / gray.shape[0]), float(max(fy + fh for _, fy, _, fh in faces) / gray.shape[0])]
             m["fx"], m["fy"], m["focus"] = m["group_x"], m["group_y"], "faces"
+            # every face, for multi-person framing: centre x/y, width, height (0..1) and mouth movement,
+            # which tells who is talking (lower-face change minus upper-face change, so nodding doesn't count)
+            boxes = []
+            for fx, fy, fw, fh in faces:
+                mouth = 0.0
+                if diff is not None:
+                    lo = diff[fy + int(fh * 0.6): fy + fh, fx + fw // 5: fx + fw - fw // 5]
+                    up = diff[fy: fy + int(fh * 0.4), fx + fw // 5: fx + fw - fw // 5]
+                    if lo.size and up.size:
+                        mouth = float(lo.mean()) / (float(up.mean()) + 2.0)  # mouth change relative to the head's own movement
+                gw, gh = gray.shape[1], gray.shape[0]
+                boxes.append([round((fx + fw / 2) / gw, 4), round((fy + fh / 2) / gh, 4), round(fw / gw, 4), round(fh / gh, 4), round(mouth, 5)])
+            m["boxes"] = boxes
     return m, gray
 
 
@@ -123,7 +143,7 @@ def analyse_video(path: str, progress=None) -> dict:
     if out_json.exists():
         return json.loads(out_json.read_text("utf-8"))
     info = media.probe(path)
-    proxy = media.make_proxy(path, CACHE / f"{key}_proxy.mp4", fps=FPS)
+    proxy = media.make_proxy(path, CACHE / f"{proxy_key(path)}_proxy.mp4", fps=FPS)
     cap = cv2.VideoCapture(str(proxy))
     frames, prev, i = [], None, 0
     total = max(1, int(info["duration"] * FPS))
@@ -140,7 +160,7 @@ def analyse_video(path: str, progress=None) -> dict:
     # carry face data to the odd frames we skipped
     for j in range(1, len(frames)):
         if frames[j]["faces"] == 0 and frames[j - 1]["faces"] > 0 and j % 2 == 1:
-            for k in ("faces", "face_x", "face_y", "face_area", "skin_luma", "group_x", "group_y", "span", "fx", "fy", "focus"):
+            for k in ("faces", "face_x", "face_y", "face_area", "skin_luma", "group_x", "group_y", "span", "fx", "fy", "focus", "boxes"):
                 if k in frames[j - 1]:
                     frames[j][k] = frames[j - 1][k]
 
@@ -152,8 +172,52 @@ def analyse_video(path: str, progress=None) -> dict:
         "log": detect_log(frames, info),
     }
     result["moments"] = build_moments(result)
+    add_signatures(result)
+    result["captured"] = capture_time(path, info)
     out_json.write_text(json.dumps(result), "utf-8")
     return result
+
+
+def signature(img) -> list:
+    """Tiny visual fingerprint: layout (16x9 grey) + colour (hue histogram), to spot near-identical scenes."""
+    small = cv2.resize(img, (16, 9), interpolation=cv2.INTER_AREA)
+    g = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32).ravel()
+    g = (g - g.mean()) / (g.std() + 1e-6)
+    hsv = cv2.cvtColor(cv2.resize(img, (64, 36)), cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0], (hsv[..., 1] > 50).astype(np.uint8), [12], [0, 180]).ravel()
+    hist = hist / (hist.sum() + 1e-6)
+    return [round(float(x), 3) for x in g] + [round(float(x), 3) for x in hist]
+
+
+def similarity(a, b) -> float:
+    """0..1: how alike two moments look (same person in the same place scores high)."""
+    if not a or not b:
+        return 0.0
+    ga, gb = np.array(a[:144]), np.array(b[:144])
+    ha, hb = np.array(a[144:]), np.array(b[144:])
+    layout = float(np.dot(ga, gb) / (np.linalg.norm(ga) * np.linalg.norm(gb) + 1e-6))
+    colour = float(np.minimum(ha, hb).sum()) if ha.sum() > 0.2 and hb.sum() > 0.2 else 0.5
+    return 0.55 * max(0.0, layout) + 0.45 * colour
+
+
+def add_signatures(a: dict):
+    cap = cv2.VideoCapture(a["proxy"])
+    for m in a["moments"]:
+        cap.set(cv2.CAP_PROP_POS_MSEC, (m["start"] + m["end"]) / 2 * 1000)
+        ok, f = cap.read()
+        if ok:
+            m["sig"] = signature(f)
+    cap.release()
+
+
+def capture_time(path: str, info: dict):
+    """When the clip was recorded (camera metadata), so clips can be put in the order things happened."""
+    tags = {**info.get("tags", {}), **info.get("vtags", {})}
+    for k in ("com.apple.quicktime.creationdate", "creation_time", "date"):
+        v = tags.get(k)
+        if v and not str(v).startswith("1970") and not str(v).startswith("1904"):
+            return str(v)
+    return None
 
 
 def analyse_photo(path: str) -> dict:
@@ -171,10 +235,11 @@ def analyse_photo(path: str) -> dict:
     m, _ = _frame_metrics(img, None, True)
     h, w = img.shape[:2]
     score = _quality(m) + 0.6 * min(1.0, m["faces"] / 3)
-    result = {"path": path, "key": key, "kind": "photo", "info": {"width": w, "height": h, "duration": 0},
+    psig = signature(img)
+    result = {"path": path, "key": key, "kind": "photo", "info": {"width": w, "height": h, "duration": 0}, "captured": None,
               "frames": [m], "moments": [{"start": 0, "end": 3.0, "score": round(score, 3), "energy": 0.3,
                                            "faces": m["faces"], "face_x": m.get("group_x", m["face_x"]),
-                                           "quality": round(_quality(m), 3), "photo": True}]}
+                                           "quality": round(_quality(m), 3), "photo": True, "scene": 0, "scene_len": 3.0, "sig": psig}]}
     out_json.write_text(json.dumps(result), "utf-8")
     return result
 
@@ -200,7 +265,7 @@ def build_moments(a: dict) -> list:
         base = np.percentile(env, 30)
         loud = np.clip((env - base) / 18.0, 0, 1)  # reactions: cheering, laughter, applause
     moments = []
-    for s, e in zip(bounds, bounds[1:]):
+    for scene, (s, e) in enumerate(zip(bounds, bounds[1:])):
         length = e - s
         if length < 0.4:
             continue
@@ -227,7 +292,8 @@ def build_moments(a: dict) -> list:
             reject = bool(blurry or dark or blown or floor or shake > 0.035)
             score = (0.34 * q + 0.22 * min(1, faces / 2) + 0.12 * min(1, face_area * 25) +
                      0.18 * peak + 0.08 * energy + 0.06 * min(1, motion * 12))
-            moments.append({"start": round(t, 2), "end": round(w_end, 2), "score": round(score, 3),
+            moments.append({"start": round(t, 2), "end": round(w_end, 2), "score": round(score, 3), "scene": scene,
+                            "scene_len": round(length, 2),
                             "quality": round(q, 3), "energy": round(max(energy, peak * 0.8), 3),
                             "faces": round(faces, 2), "face_x": round(float(np.median(fx)) if fx else 0.5, 3),
                             "motion": round(motion, 3), "shake": round(shake, 4), "reject": reject,

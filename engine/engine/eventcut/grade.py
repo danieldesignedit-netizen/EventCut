@@ -136,7 +136,7 @@ def highlight_rolloff(x, start=0.8):
     return clamp(np.minimum(x, start) + over * (1 - over / (2 * (1 - start) + 1e-6)))
 
 
-PRESETS = {}
+PRESETS = {"None": lambda x: x}  # original colours, no look
 
 
 def preset(name):
@@ -243,6 +243,9 @@ def build_lut(log_profile=None, correction=None, preset_name="Vibrant Cinematic"
               transfer=None, theme_hex=None, custom_cube=None):
     x = grid()
     x = decode_log(x, log_profile)
+    if preset_name == "None":
+        # no grading at all: the footage's own colours (Log footage is still converted so it doesn't look grey)
+        return clamp(x)
     if correction:
         x = apply_correction(x, correction)
     if transfer:

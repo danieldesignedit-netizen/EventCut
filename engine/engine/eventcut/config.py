@@ -6,7 +6,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.4.0"
 PORT = int(os.environ.get("EVENTCUT_PORT", "7788"))
 
 # Origins allowed to drive this engine. The installer writes the real Netlify URL
@@ -90,3 +90,28 @@ def load_settings() -> dict:
 def save_settings(data: dict) -> None:
     ensure_folders()
     SETTINGS_FILE.write_text(json.dumps(data, indent=2), "utf-8")
+
+
+def _json_default(o):
+    """Let numpy numbers (float32, int64, arrays) be saved as JSON."""
+    try:
+        import numpy as np
+        if isinstance(o, np.generic):
+            return o.item()
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+    except Exception:
+        pass
+    if isinstance(o, Path):
+        return str(o)
+    raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+
+
+def install_json_numpy_support():
+    import json as _json
+    _orig = _json.dumps
+
+    def dumps(obj, *a, **kw):
+        kw.setdefault("default", _json_default)
+        return _orig(obj, *a, **kw)
+    _json.dumps = dumps
