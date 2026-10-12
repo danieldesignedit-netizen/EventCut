@@ -468,10 +468,67 @@ def run_remix(job: Job):
         play_sound(False)
 
 
+def run_recaption(job: Job):
+    """Caption edits: re-draw the captions on the finished picture (no re-edit, no re-render of shots)."""
+    p = job.payload
+    try:
+        job.state = "running"
+        folder = Path(p["folder"])
+        meta = json.loads((folder / "project.json").read_text("utf-8"))
+        s = dict(meta["settings"], **(p.get("settings") or {}), captions=True)
+        words = [w for w in (p.get("words") or []) if str(w.get("word", "")).strip()]
+        job.plan_stages({f"cap_{i}": 20 for i in range(len(meta["outputs"]))})
+        outs = []
+        for i, o in enumerate(meta["outputs"]):
+            job.set_stage(f"cap_{i}", f"Updating captions, {o['format']}")
+            fdir = Path(o["video"]).parent
+            fs = dict(s, format=o["format"], name=Path(o["video"]).stem)
+            r = render.Renderer(meta["plan"], fs, [], fdir)
+            body = next(r.work.glob("body.mov"), None) or next(r.work.glob("run_0.mov"))
+            end = r.work / "endcard.mov"
+            end = end if end.exists() and s.get("end_card", True) else None
+            caps = r.captions_ass(words) if words else None
+            if words:
+                r.write_srt(words)
+                (fdir / "captions.json").write_text(json.dumps(words), "utf-8")
+            video = r.finish_video(body, end, caps)
+            mix = r.work / "mix.wav"
+            outs.append(r.export(video, mix))
+        # remember the corrections, so the next version of a video from this footage spells it right
+        fixes = {}
+        for w in words:
+            if w.get("src") and w.get("s0") is not None and w.get("edited"):
+                fixes.setdefault(w["src"], []).append(w)
+        for src, ws in fixes.items():
+            f = smart.TRANS_CACHE / f"{analyze.proxy_key(src)}.json"
+            if f.exists():
+                tr = json.loads(f.read_text("utf-8"))
+                for w in ws:
+                    for t in tr:
+                        if abs(t["start"] - float(w["s0"])) < 0.05:
+                            t["word"] = " " + str(w["word"]).strip()
+                            break
+                f.write_text(json.dumps(tr), "utf-8")
+        meta["settings"].update({k: v for k, v in (p.get("settings") or {}).items()})
+        meta["settings"]["captions"] = bool(words)
+        meta["outputs"] = outs
+        (folder / "project.json").write_text(json.dumps(meta, indent=1), "utf-8")
+        job.result = {"folder": str(folder), "outputs": outs}
+        job.state, job.stage, job.progress = "done", "Done", 1.0
+        job.eta = {"stage_left": 0, "total_left": 0, "elapsed": round(time.time() - job.started)}
+        job.push()
+        play_sound(True)
+    except Exception as e:
+        traceback.print_exc()
+        job.state, job.error = "failed", str(e).splitlines()[0][:300]
+        job.push()
+        play_sound(False)
+
+
 def start_job(kind, payload, user):
     job = Job(kind, payload, user)
     JOBS[job.id] = job
-    target = {"generate": run_generate, "remix": run_remix}[kind]
+    target = {"generate": run_generate, "remix": run_remix, "recaption": run_recaption}[kind]
     threading.Thread(target=target, args=(job,), daemon=True).start()
     return job
 
@@ -694,11 +751,18 @@ class Handler(BaseHTTPRequestHandler):
             est.update(seconds=round(secs), enabled=gemini.enabled(), month_spend=round(gemini.month_spend(), 3), cap=gemini.cfg()["cap"])
             return self.send_json(est)
         if path == "/ai/test" and method == "POST":
-            key = (self.body().get("key") or gemini.cfg()["key"]).strip()
+            tb = self.body()
+            key = (tb.get("key") or gemini.cfg()["key"]).strip()
             try:
-                return self.send_json({"ok": True, "model": gemini.test_key(key)})
+                return self.send_json({"ok": True, "model": gemini.test_key(key, tb.get("tier"))})
             except gemini.AIError as e:
                 return self.send_json({"ok": False, "error": str(e)}, 400)
+        if path == "/captions":
+            folder = q.get("folder", [""])[0]
+            if not folder or not path_allowed(folder):
+                return self.send_json({"words": []})
+            f = next(Path(folder).glob("*/captions.json"), None)
+            return self.send_json({"words": json.loads(f.read_text("utf-8")) if f else []})
         if path == "/feed-copy" and method == "POST":
             b = self.body()
             res = feed_copy(b.get("path", ""))

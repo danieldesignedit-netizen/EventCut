@@ -111,14 +111,29 @@ def logo_path_ok(p: Path) -> bool:
         return False
 
 
-def fx_leak(work: Path, style: int = 0) -> Path:
-    """A 0.9 s light-leak flare with transparency (generated, so it's original and free to use)."""
-    out = work / f"leak_{style}.mov"
+def _rgb(h):
+    h = (h or "#FFFFFF").strip().lstrip("#")
+    h = "".join(c * 2 for c in h) if len(h) == 3 else h
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def fx_leak(work: Path, style: int = 0, colors=None) -> Path:
+    """A 0.9 s light-leak flare with transparency (generated, so it's original and free to use).
+
+    Its colours come from the brand's hex codes; without them it's a neutral warm white, never a preset hue."""
+    cols = [c for c in (colors or []) if c and c.upper() not in ("#FFFFFF", "#000000")]
+    tag = "-".join(c.strip("#") for c in cols) or "neutral"
+    out = work / f"leak_{style}_{tag}.mov"
     if out.exists():
         return out
     W, H, fps, n = 480, 270, 25, 23
-    palettes = [[(255, 140, 60), (255, 60, 120)], [(255, 200, 120), (255, 90, 40)], [(120, 160, 255), (200, 90, 255)], [(255, 120, 200), (255, 220, 160)]]
-    pal = np.array(palettes[style % 4], np.float32) / 255
+    if cols:
+        a_, b_ = _rgb(cols[style % len(cols)]), _rgb(cols[(style + 1) % len(cols)])
+        # lighten the brand colours so the flare reads as light, not paint
+        pal = [[min(255, int(v * 0.75 + 255 * 0.25)) for v in a_], [min(255, int(v * 0.75 + 255 * 0.25)) for v in b_]]
+    else:
+        pal = [(255, 236, 214), (255, 214, 170)]
+    pal = np.array(pal, np.float32) / 255
     yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
     ff, _ = tools()
     p = __import__("subprocess").Popen([ff, "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{W}x{H}", "-r", str(fps), "-i", "-",
@@ -550,8 +565,12 @@ class Renderer:
             t = t.strip()
             return t.upper() if upper else t
         ev = []
-        for ln in lines:
+        for li, ln in enumerate(lines):
+            # a line never lingers into the next one (two lines on screen at once made captions jump)
+            nxt_start = lines[li + 1][0]["start"] if li + 1 < len(lines) else None
             end_all = ln[-1]["end"] + 0.15
+            if nxt_start is not None:
+                end_all = max(ln[-1]["end"], min(end_all, nxt_start - 0.01))
             if name == "karaoke":
                 # one event per line; each word fills from white to the accent colour as it is spoken
                 parts = []
@@ -564,8 +583,10 @@ class Renderer:
                 ev.append(f"Dialogue: 0,{ts(ln[0]['start'])},{ts(end_all)},Cap,,0,0,0,,{{\\fad(100,80)}}" + " ".join(word(w["word"]) for w in ln))
                 continue
             for k, w in enumerate(ln):  # one event per word: the line, with the spoken word highlighted
-                start = w["start"]
+                start = ln[0]["start"] if k == 0 else w["start"]  # no gap before the first word lights up
                 end = ln[k + 1]["start"] if k + 1 < len(ln) else end_all
+                if end <= start:
+                    continue
                 parts = []
                 for j2, ww in enumerate(ln):
                     t = word(ww["word"])
@@ -574,8 +595,8 @@ class Renderer:
                             parts.append(f"{{\\1c{acc}&}}{t}{{\\1c{white}&}}")
                         elif name == "neon":
                             parts.append(f"{{\\1c{white}&\\blur1}}{t}{{\\1c{acc}&\\blur{cfg.get('blur', 0)}}}")
-                        else:
-                            parts.append(f"{{\\1c{acc}&\\fscx108\\fscy108}}{t}{{\\1c{white}&\\fscx100\\fscy100}}")
+                        else:  # colour only: changing size made the whole line shift on every word
+                            parts.append(f"{{\\1c{acc}&}}{t}{{\\1c{white}&}}")
                     else:
                         parts.append(t)
                 fx = "{\\fad(80,0)}" if k == 0 else ""
@@ -599,7 +620,8 @@ class Renderer:
                 continue
             for w in transcripts.get(s["src"], []):
                 if s["kind"] != "photo" and s["in"] <= w["start"] and w["end"] <= s["out"]:
-                    out.append({"word": w["word"], "start": t + w["start"] - s["in"], "end": t + w["end"] - s["in"]})
+                    out.append({"word": w["word"], "start": round(t + w["start"] - s["in"], 3), "end": round(t + w["end"] - s["in"], 3),
+                                "src": s["src"], "s0": w["start"]})  # where it came from, so corrections can be remembered
             t += s["length"]
         return out
 
@@ -627,7 +649,7 @@ class Renderer:
         label, nxt = "b", 2
         # light leaks: warm flares over a few key moments
         for k, lk in enumerate(self.plan.get("leaks", []) if self.s.get("light_leaks", True) and not self.preview else []):
-            leak = fx_leak(self.work, lk.get("style", 0))
+            leak = fx_leak(self.work, lk.get("style", 0), self.s.get("theme") or [])
             args += ["-i", str(leak)]
             fc += (f";[{nxt}:v]scale={W}:{H},format=rgba,setpts=PTS-STARTPTS+{lk['at']:.3f}/TB[lk{k}];"
                    f"[{label}][lk{k}]overlay=eof_action=pass:format=auto[lo{k}]")
@@ -779,6 +801,7 @@ class Renderer:
             if words:
                 captions = self.captions_ass(words)
                 self.write_srt(words)
+                (self.out / "captions.json").write_text(json.dumps(words), "utf-8")  # for the caption editor
         self.check()
         self.progress("graphics", 0.3, "Adding titles, logo and captions")
         video = self.finish_video(body, end, captions)

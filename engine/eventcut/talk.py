@@ -292,6 +292,18 @@ def plan_talk(analyses, settings, grid, transcripts=None, ai=None, rng=None, sou
     def overlaps(c, picked, pad=1.5):
         return any(o["src"] == c["src"] and c["start"] < o["end"] + pad and o["start"] < c["end"] + pad for o in picked)
 
+    # variety: moments from the same clip must be a real distance apart (a different part of the conversation),
+    # and every extra moment from a clip that's already used counts a little less
+    def spacing(p):
+        d = float(by_path[p].get("info", {}).get("duration") or 60)
+        return float(np.clip(d * 0.06, 15.0, 120.0))
+
+    def too_close(c, picked):
+        return any(o["src"] == c["src"] and abs(o["start"] - c["start"]) < spacing(c["src"]) for o in picked)
+
+    def spread_rank(c, picked):
+        return c["rank"] - 0.15 * sum(1 for o in picked if o["src"] == c["src"])
+
     # 1. hook: the single most gripping complete line, 3-6 s (up to 8 s if nothing shorter is strong)
     hook = None
     if settings.get("hook", True) is not False:
@@ -302,24 +314,37 @@ def plan_talk(analyses, settings, grid, transcripts=None, ai=None, rng=None, sou
 
     # 2. the closer: a payoff (biggest laugh or reaction right after, or the AI's pick), so the video lands
     cliff = None
-    closers = [c for c in cands if not overlaps(c, picked) and c["end"] - c["start"] <= 12 and not c["question"]]
+    closers = [c for c in cands if not overlaps(c, picked) and not too_close(c, picked) and c["end"] - c["start"] <= 12 and not c["question"]]
     if closers:
-        cliff = max(closers, key=lambda c: c["rank"] + 0.5 * c.get("payoff", 0))
+        cliff = max(closers, key=lambda c: spread_rank(c, picked) + 0.5 * c.get("payoff", 0))
         picked.append(cliff)
 
     # 3. the story: best remaining bites until the length is filled, then in the order they were said
     used = sum(c["end"] - c["start"] for c in picked)
     story = []
-    for c in sorted(cands, key=lambda c: -c["rank"]):
-        if used >= body * 0.97:
+    ranks = sorted(c["rank"] for c in cands)
+    median = ranks[len(ranks) // 2] if ranks else 0
+    # first, the best moment from each clip that has a strong one, so one conversation doesn't take over
+    for p in by_path:
+        mine = [c for c in cands if c["src"] == p and c["rank"] >= median and c["end"] - c["start"] <= max_bite
+                and not overlaps(c, picked + story) and not too_close(c, picked + story)]
+        if mine and used < body * 0.97:
+            c = max(mine, key=lambda c: c["rank"])
+            if used + (c["end"] - c["start"]) <= body * 1.06:
+                story.append(c)
+                used += c["end"] - c["start"]
+    while used < body * 0.97:
+        free = [c for c in cands if c["end"] - c["start"] <= max_bite and not overlaps(c, picked + story)
+                and used + (c["end"] - c["start"]) <= body * 1.06]
+        spaced = [c for c in free if not too_close(c, picked + story)]
+        # short recordings: allow closer moments rather than ending far too short
+        pool = spaced or [c for c in free if not any(o["src"] == c["src"] and abs(o["start"] - c["start"]) < spacing(c["src"]) / 3
+                                                     for o in picked + story)]
+        if not pool:
             break
-        d = c["end"] - c["start"]
-        if d > max_bite or overlaps(c, picked + story):
-            continue
-        if used + d > body * 1.06:
-            continue  # too long for what's left: a shorter bite may fit
+        c = max(pool, key=lambda c: spread_rank(c, picked + story))
         story.append(c)
-        used += d
+        used += c["end"] - c["start"]
     order = {p: i for i, p in enumerate(source_order or list(by_path))}
     story.sort(key=lambda c: (order.get(c["src"], 0), c["start"]))
 

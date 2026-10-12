@@ -305,8 +305,8 @@ def analyse_clip(path, event_type, duration_s, key_for_cache, progress=None):
     return result
 
 
-def test_key(key):
+def test_key(key, tier=None):
     """Quick check from Settings: the key works and which model will be used."""
-    model = pick_model(key, cfg()["tier"])
+    model = pick_model(key, tier or cfg()["tier"])
     _req("GET", f"{API}/v1beta/models/{model}", key, timeout=20)
     return model
