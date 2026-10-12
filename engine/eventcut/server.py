@@ -252,6 +252,42 @@ def raw_frame(p, t, width=960, wide=False):
     return out
 
 
+def ai_colour_pass(analyses, s, job=None):
+    """Ask the Google AI colourist about one representative, corrected frame per clip (in parallel)."""
+    from concurrent.futures import ThreadPoolExecutor
+    ff, _ = media.tools()
+    look = s.get("preset", "Vibrant Cinematic")
+    vids = [a for a in analyses if a.get("kind") == "video" and a.get("moments")]
+
+    def one(a):
+        good = [m for m in a["moments"] if not m.get("reject")] or a["moments"]
+        m = max(good, key=lambda m: m.get("score", 0))
+        t = (m["start"] + m["end"]) / 2
+        log = a.get("log") or {}
+        lut = grade.lut_for(log_profile=log.get("profile") if log.get("is_log") else None,
+                            correction=grade.correction_params(a.get("frames", [])), preset_name="Natural", intensity=0.0)
+        jpg = HOME / "Projects" / "_thumbs" / f"aicol_{a['key']}_{round(t, 1)}.jpg"
+        jpg.parent.mkdir(parents=True, exist_ok=True)
+        if not jpg.exists():
+            media.run([ff, "-y", "-v", "error", "-ss", f"{t:.2f}", "-i", a["path"], "-vf", f"scale=768:-2,lut3d=file='{render.fpath(lut)}'",
+                       "-frames:v", "1", "-q:v", "4", str(jpg)])
+        return a["path"], gemini.colourist(jpg, look, s.get("event_type", ""), analyze.proxy_key(a["path"]))
+    out, done = {}, 0
+    with ThreadPoolExecutor(4) as pool:
+        for fut in [pool.submit(one, a) for a in vids]:
+            try:
+                p, params = fut.result()
+                out[p] = params
+            except gemini.AIError:
+                pass  # this clip keeps the standard correction
+            except Exception:
+                traceback.print_exc()
+            done += 1
+            if job:
+                job.update(done / max(1, len(vids)), f"Clip {done} of {len(vids)}")
+    return out
+
+
 def export_name(event, fmt, version_dir):
     """EventCut_Team-Bonding_9x16_v3_2026-10-11: sorts by event, then shape, version and date."""
     words = re.sub(r"[^A-Za-z0-9 -]+", " ", event or "Event").split()
@@ -263,6 +299,9 @@ def export_name(event, fmt, version_dir):
 def run_generate(job: Job):
     p = job.payload
     s = dict(p.get("settings") or {})
+    if not int(s.get("seed") or 0):  # every new video gets its own randomness: music, effects, picks
+        import random
+        s["seed"] = random.randint(1, 2_000_000_000)
     try:
         job.state = "running"
         items = p.get("media") or media.scan(p.get("paths", []))[0]
@@ -281,6 +320,7 @@ def run_generate(job: Job):
         job.plan_stages({"analyse": 1 if cached else foot * sp["analyse"],
                          "transcribe": foot * sp["transcribe"] if want_words else 0,
                          "ai": foot * 0.05 + 40 if use_ai else 0,
+                         "colour": 3 * len(vids) if (bool(gemini.cfg()["key"]) and load_settings().get("google_colour", True) and s.get("preset") != "None") else 0,
                          "director": 25 if s.get("director") else 0, "plan": 2,
                          **{f"render_{f}": dur * sp["render"] for f in formats},
                          **{f"finish_{f}": dur * sp["finish"] for f in formats}})
@@ -343,7 +383,16 @@ def run_generate(job: Job):
                     s["title"] = next(iter(ai.values())).get("title") or ""
             except gemini.AIError as e:
                 ai, ai_note = {}, f"Google AI wasn't used ({e}). EventCut chose the moments itself."
+        # 2c. Google AI colourist: gentle, per-clip corrections before the look
+        if gemini.cfg()["key"] and load_settings().get("google_colour", True) and s.get("preset") != "None":
+            job.set_stage("colour", "Google AI is grading each clip")
+            s["ai_colour"] = ai_colour_pass(analyses, s, job)
         s["_ai"] = ai
+        if ai and transcripts:  # the AI's quotes fix Pidgin words the speech-to-text misheard (timings stay)
+            from . import talk as _talk
+            for pth, r_ in ai.items():
+                if transcripts.get(pth):
+                    transcripts[pth] = _talk.apply_quotes(transcripts[pth], r_.get("bites"))
         # 3. director (optional)
         if s.get("director"):
             job.set_stage("director", "Director mode is choosing the story")
@@ -370,7 +419,7 @@ def run_generate(job: Job):
         seed = int(s.get("seed", 0))
         if not music.get("path") and not music.get("mood"):
             # automatic: new music for every version (library track for the mood if online, else an original)
-            family = s.get("music_family") or story.mood_from_prompt(s.get("prompt", ""), story.template_for(s.get("event_type", "")))
+            family = s.get("music_family") or story.music_family(s)
             job.update(0.3, "Choosing music")
             music = audio.pick_auto_music(family, dur, seed, online=s.get("online_music", True))
             s["music"] = music
@@ -500,7 +549,7 @@ def run_recaption(job: Job):
             if w.get("src") and w.get("s0") is not None and w.get("edited"):
                 fixes.setdefault(w["src"], []).append(w)
         for src, ws in fixes.items():
-            f = smart.TRANS_CACHE / f"{analyze.proxy_key(src)}.json"
+            f = smart.transcript_path(analyze.proxy_key(src))
             if f.exists():
                 tr = json.loads(f.read_text("utf-8"))
                 for w in ws:
@@ -814,7 +863,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"ok": True})
         if path == "/transcript":
             p = q.get("path", [""])[0]
-            f = smart.TRANS_CACHE / f"{analyze.proxy_key(p)}.json"
+            f = smart.transcript_path(analyze.proxy_key(p))
             return self.send_json({"words": json.loads(f.read_text("utf-8")) if f.exists() else []})
         if path == "/candidates":
             # alternative moments for swapping a clip in the review timeline
@@ -834,7 +883,8 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST":
                 b = self.body()
                 for k in ("notify_sound", "notify_volume", "director_mode_api_key", "director_monthly_cap_usd", "director_mode_model",
-                          "google_api_key", "google_model", "google_monthly_cap_usd", "use_google_ai", "google_prices"):
+                          "google_api_key", "google_model", "google_monthly_cap_usd", "use_google_ai", "google_prices", "speech_language",
+                          "google_colour"):
                     if k in b:
                         cfg[k] = b[k]
                 save_settings(cfg)

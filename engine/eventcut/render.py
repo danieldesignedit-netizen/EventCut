@@ -204,10 +204,13 @@ class Renderer:
         if ref and a.get("frames"):
             transfer = {"src": self._source_lab_stats(src), "ref": ref, "strength": float(self.s.get("match_strength", 0.7))}
         custom = self.s.get("custom_lut")
+        ai = (self.s.get("ai_colour") or {}).get(src)  # the Google AI colourist's notes for this clip
+        if ai:
+            ai = {k: v for k, v in ai.items() if k != "note"}
         return grade.lut_for(log_profile=profile, correction=corr, preset_name=self.s.get("preset", "Vibrant Cinematic"),
                              intensity=float(self.s.get("intensity", 1.0)), transfer=transfer,
                              theme_hex=self.primary if self.s.get("theme_tint") else None,
-                             custom_cube=custom if custom and Path(custom).exists() else None)
+                             custom_cube=custom if custom and Path(custom).exists() else None, ai=ai or None)
 
     def _source_lab_stats(self, src):
         import cv2
@@ -254,7 +257,8 @@ class Renderer:
             sw, sh = info.get("width", W), info.get("height", H)
             # slow-motion for high-frame-rate clips in emotional/close sections
             src_fps = float(info.get("fps") or 25)
-            slow = shot["section"] in ("emotional", "close") and src_fps >= 48 and not self.preview and not shot.get("layouts")
+            slow = (shot["section"] in ("emotional", "close") or (self.plan.get("slowmo") and shot["section"] == "peak" and shot.get("score", 0) > 0.75)) \
+                and self.plan.get("slowmo", True) and src_fps >= 48 and not self.preview and not shot.get("layouts")
             if slow:
                 factor = min(2.0, src_fps / self.fps)
                 args[args.index("-t") + 1] = f"{length / factor:.3f}"
@@ -372,14 +376,15 @@ class Renderer:
         W, H, fps = self.W, self.H, f"fps={self.fps}"
         mode = lay.get("mode")
         if mode == "speaker":
-            x, y, cw, ch = self._face_crop(lay["box"], sw, sh, W, H, 0.36 if H > W else 0.22, 0.34)
+            frac = (0.36 if H > W else 0.22) * (1.3 if lay.get("tight") else 1.0)  # tight = punch-in on the same speaker
+            x, y, cw, ch = self._face_crop(lay["box"], sw, sh, W, H, frac, 0.34)
             return [f"crop={cw}:{ch}:{x}:{y}", f"scale={W}:{H}:flags=lanczos", fps]
         if mode == "punch":
             cw = sw / 1.45
             x, y, cw, ch = self._face_crop(lay["box"], sw, sh, W, H, max(0.08, lay["box"][2] * sw / cw), 0.40)
             return [f"crop={cw}:{ch}:{x}:{y}", f"scale={W}:{H}:flags=lanczos", fps]
         if mode == "stack":
-            boxes = sorted(lay["boxes"], key=lambda b: b[0])[:3]
+            boxes = (lay["boxes"] if lay.get("order") == "given" else sorted(lay["boxes"], key=lambda b: b[0]))[:3]
             n = len(boxes)
             hs = [H // n // 2 * 2] * (n - 1)
             hs.append(H - sum(hs))

@@ -19,7 +19,7 @@ from .config import HOME, load_settings
 
 API = os.environ.get("EVENTCUT_GEMINI_API", "https://generativelanguage.googleapis.com")  # override only for testing
 CACHE = HOME / "Projects" / "_ai"
-PROMPT_VERSION = "p3"
+PROMPT_VERSION = "p4"
 # Tokens Google counts per second of video at low media resolution, one frame a second (70) plus sound (25).
 VIDEO_TOK_S, AUDIO_TOK_S = 70, 25
 # US$ per million tokens. Prices change: they can be edited in Settings (google_prices).
@@ -210,6 +210,11 @@ def _prompt(event_type, duration_s):
     return f"""You are a senior video editor who cuts viral short-form videos from long recordings.
 This video is a {event_type or 'company event'} recording, {int(duration_s // 60)} min {int(duration_s % 60)} s long.
 
+Language: speakers may use Nigerian Pidgin English, English, or a mix, with some Yoruba, Igbo or Hausa words.
+Understand all of it, judge humour and meaning in that context, and quote exactly what is said in the speakers'
+own words using common Nigerian Pidgin spelling (for example: wetin, abeg, dey, na, oya, sabi, wahala, comot,
+una, abi, sha, o). Never translate or "correct" Pidgin into standard English.
+
 Find the strongest soundbites for short social videos (Reels, TikTok, Shorts). Rules:
 - Each soundbite is a COMPLETE thought: it starts at the first word of a sentence and ends at the last word of a
   sentence. Never start mid-sentence or with a filler ("and", "so", "um"). It must make sense on its own.
@@ -310,3 +315,65 @@ def test_key(key, tier=None):
     model = pick_model(key, tier or cfg()["tier"])
     _req("GET", f"{API}/v1beta/models/{model}", key, timeout=20)
     return model
+
+
+# ------------------------------------------------------------------ colourist: per-clip grading decisions
+COLOUR_VERSION = "c1"
+COLOUR_SCHEMA = {"type": "OBJECT", "properties": {
+    "temperature": {"type": "NUMBER"}, "tint": {"type": "NUMBER"}, "exposure": {"type": "NUMBER"},
+    "contrast": {"type": "NUMBER"}, "highlights": {"type": "NUMBER"}, "shadows": {"type": "NUMBER"},
+    "saturation": {"type": "NUMBER"}, "reduce_green": {"type": "NUMBER"}, "note": {"type": "STRING"}},
+    "required": ["temperature", "tint", "exposure", "contrast", "highlights", "shadows", "saturation", "reduce_green"]}
+
+
+def _colour_prompt(look, event_type):
+    return f"""You are a veteran film colourist grading a {event_type or 'company event'} video.
+This frame is from one clip, after basic white balance and exposure correction. The look "{look}" will be applied
+on top of your adjustments, so do not recreate the look: make this shot sit well and look expensive before it.
+
+Return gentle adjustments (0 means leave it):
+- temperature -1..1 (positive warmer), tint -1..1 (positive magenta, negative green)
+- exposure -0.7..0.7 stops, contrast -0.5..0.5
+- highlights -0.5..0.5 (negative recovers bright skies, screens and stage lights)
+- shadows -0.5..0.5 (positive opens up dark areas; keep blacks rich)
+- saturation -0.5..0.5
+- reduce_green 0..1: remove a green cast from LED or fluorescent light, or tame neon-green walls. Keep real greens
+  such as grass, brand colours or deliberate set lighting.
+- note: one short sentence on what you changed.
+
+Priorities, in order: natural, healthy, rich skin for darker skin tones (never grey, ashy, orange or washed out);
+no clipped highlights on faces; a clean, cinematic image; consistency with other shots of the same event.
+Be subtle. Most values should be between -0.3 and 0.3. Use 0 when unsure."""
+
+
+def colourist(frame_jpg, look, event_type, cache_tag):
+    """Adjustments for one clip from one representative frame. Cached; a fraction of a cent per clip."""
+    import base64
+    c = cfg()
+    CACHE.mkdir(parents=True, exist_ok=True)
+    tag = hashlib.sha1(f"{cache_tag}|{look}|{c['tier']}|{COLOUR_VERSION}".encode()).hexdigest()[:16]
+    out = CACHE / f"colour_{tag}.json"
+    if out.exists():
+        return json.loads(out.read_text("utf-8"))
+    if month_spend() >= c["cap"]:
+        raise AIError("Google AI has reached this month's spending cap.")
+    model = pick_model(c["key"], c["tier"])
+    data = base64.b64encode(Path(frame_jpg).read_bytes()).decode()
+    body = {"contents": [{"role": "user", "parts": [{"inline_data": {"mime_type": "image/jpeg", "data": data}},
+                                                     {"text": _colour_prompt(look, event_type)}]}],
+            "generationConfig": {"temperature": 0.2, "response_mime_type": "application/json", "response_schema": COLOUR_SCHEMA}}
+    try:
+        resp = _req("POST", f"{API}/v1beta/models/{model}:generateContent", c["key"], body=body, timeout=120)
+    except AIError as e:
+        if "(400)" not in str(e):
+            raise
+        body["generationConfig"].pop("response_schema", None)
+        resp = _req("POST", f"{API}/v1beta/models/{model}:generateContent", c["key"], body=body, timeout=120)
+    log_spend(resp.get("usageMetadata", {}), c["tier"])
+    d = _json_from(resp)
+    lim = {"temperature": 1, "tint": 1, "exposure": 0.7, "contrast": 0.5, "highlights": 0.5, "shadows": 0.5, "saturation": 0.5}
+    p = {k: round(max(-v, min(v, float(d.get(k, 0) or 0))), 3) for k, v in lim.items()}
+    p["reduce_green"] = round(max(0.0, min(1.0, float(d.get("reduce_green", 0) or 0))), 3)
+    p["note"] = str(d.get("note", ""))[:200]
+    out.write_text(json.dumps(p), "utf-8")
+    return p

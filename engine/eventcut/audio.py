@@ -591,21 +591,47 @@ def download_online(item: dict, category: str = "music") -> str:
     return str(dest)
 
 
+HISTORY = LIB / "music_history.json"
+
+
+def _history():
+    try:
+        return json.loads(HISTORY.read_text("utf-8"))
+    except Exception:
+        return []
+
+
+def _remember(key):
+    h = [k for k in _history() if k != key][-24:] + [key]
+    HISTORY.parent.mkdir(parents=True, exist_ok=True)
+    HISTORY.write_text(json.dumps(h), "utf-8")
+
+
 def pick_auto_music(family: str, duration: float, seed: int, online: bool = True):
-    """Different music every regenerate: a library track for the mood (online), otherwise an EventCut original style."""
+    """A different song every new video and every regenerate: a library track for the mood (online), otherwise an
+    EventCut original. The last couple of dozen picks are remembered and never repeated."""
     rng = np.random.default_rng(seed * 104729 + 7)
+    recent = set(_history())
     if online:
         try:
-            q = str(rng.choice(FAMILY_QUERIES.get(family, FAMILY_QUERIES["upbeat"])))
-            res = search_online(q, "music", page=int(rng.integers(1, 4)))
-            good = [r for r in res["results"] if r["duration"] >= min(duration * 0.8, duration + 5) and r["duration"] <= 600]
-            if good:
-                item = good[int(rng.integers(len(good)))]
-                return {"path": download_online(item, "music"), "title": item["title"], "creator": item["creator"],
-                        "license": item["license"], "source": "library"}
+            queries = list(FAMILY_QUERIES.get(family, FAMILY_QUERIES["upbeat"]))
+            rng.shuffle(queries)
+            for q in queries[:3]:
+                res = search_online(str(q), "music", page=int(rng.integers(1, 6)))
+                good = [r for r in res["results"] if r["duration"] >= min(duration * 0.8, duration + 5) and r["duration"] <= 600
+                        and f"lib:{r.get('id')}" not in recent]
+                if good:
+                    item = good[int(rng.integers(len(good)))]
+                    _remember(f"lib:{item.get('id')}")
+                    return {"path": download_online(item, "music"), "title": item["title"], "creator": item["creator"],
+                            "license": item["license"], "source": "library"}
         except Exception:
             pass
-    style = style_cfg(family, seed)["name"]
+    # EventCut originals: a style not used recently, with a fresh key, tempo and melody from the seed
+    styles = FAMILIES.get(family) or list(MOODS)
+    fresh = [s for s in styles if f"gen:{s}" not in recent] or styles
+    style = str(rng.choice(fresh))
+    _remember(f"gen:{style}")
     return {"mood": style, "title": f"{style} (EventCut original)", "source": "generated"}
 
 
