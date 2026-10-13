@@ -4,6 +4,7 @@ Everything runs on small proxies so hours of footage stay manageable, and result
 cached so regenerating a video never re-analyses the same file.
 """
 import hashlib
+import threading
 import json
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from .config import HOME
 
 CACHE = HOME / "Projects" / "_analysis"
 FPS = 10  # proxy frame rate used for analysis
-_face = None
+_tls = threading.local()  # one face detector per worker thread (several clips are analysed at once)
 
 
 def _model_path(name: str) -> str:
@@ -26,9 +27,9 @@ def _model_path(name: str) -> str:
 
 def _detect_faces(img):
     """YuNet face detector (MIT licence, bundled). Returns list of (x, y, w, h)."""
-    global _face
+    _face = getattr(_tls, "face", None)
     if _face is None:
-        _face = cv2.FaceDetectorYN.create(_model_path("face_detection_yunet_2023mar.onnx"), "", (320, 320), 0.72, 0.3, 50)
+        _face = _tls.face = cv2.FaceDetectorYN.create(_model_path("face_detection_yunet_2023mar.onnx"), "", (320, 320), 0.72, 0.3, 50)
     h, w = img.shape[:2]
     _face.setInputSize((w, h))
     _, faces = _face.detect(img)

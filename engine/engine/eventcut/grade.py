@@ -152,8 +152,8 @@ def _vibrant_cinematic(x):
     x = black_crush(x, 0.035)
     x = s_curve(x, 0.55, 0.42)
     x = highlight_rolloff(x, 0.82)
-    x = split_tone(x, (0.42, 0.48, 0.62), (0.6, 0.53, 0.42), 0.07, 0.45)
-    x = saturate(x, 1.32, vibrance=0.25, protect_skin=0.55)
+    x = split_tone(x, (0.45, 0.5, 0.57), (0.6, 0.53, 0.42), 0.07, 0.45)  # cool, not violet, shadows
+    x = saturate(x, 1.28, vibrance=0.25, protect_skin=0.6)
     return x
 
 
@@ -198,6 +198,103 @@ def _bw(x):
     return black_crush(y, 0.02)
 
 
+# ------------------------------------------------------------------ film looks: restrained, the way a film colourist works
+def hue_sat(x, hue_lo, hue_hi, amount):
+    """Change saturation of one hue band only (hue in 0..1), e.g. calm down neon greens."""
+    import colorsys as _c  # noqa: F401 (documentation of hue convention)
+    r, g, b = x[..., 0], x[..., 1], x[..., 2]
+    mx, mn = x.max(-1), x.min(-1)
+    d = np.maximum(mx - mn, 1e-6)
+    h = np.where(mx == r, ((g - b) / d) % 6, np.where(mx == g, (b - r) / d + 2, (r - g) / d + 4)) / 6
+    w = clamp(1 - np.abs(((h - (hue_lo + hue_hi) / 2 + 0.5) % 1) - 0.5) / max(1e-3, (hue_hi - hue_lo) / 2))[..., None]
+    y = luma(x)[..., None]
+    return clamp(y + (x - y) * (1 + (amount - 1) * w))
+
+
+def matte(x, black=0.02, white=0.98):
+    return clamp(black + x * (white - black))
+
+
+@preset("Film Print")
+def _film_print(x):
+    # classic cinema print stock: dense but soft blacks, warm highlights, cyan-leaning shadows, calm greens
+    x = s_curve(x, 0.42, 0.44)
+    x = highlight_rolloff(x, 0.74)
+    x = split_tone(x, (0.45, 0.52, 0.54), (0.6, 0.54, 0.45), 0.08, 0.48)
+    x = hue_sat(x, 0.22, 0.45, 0.72)
+    x = saturate(x, 1.04, 0.06, 0.65)
+    return matte(x, 0.025, 0.97)
+
+
+@preset("Muted Film")
+def _muted_film(x):
+    # soft, low-saturation film look with gentle contrast: grown-up and quiet
+    x = s_curve(x, 0.26, 0.46)
+    x = highlight_rolloff(x, 0.78)
+    x = split_tone(x, (0.47, 0.52, 0.51), (0.55, 0.53, 0.49), 0.06, 0.5)
+    x = saturate(x, 0.8, 0.05, 0.7)
+    return matte(x, 0.03, 0.96)
+
+
+@preset("Documentary Soft")
+def _documentary(x):
+    # honest and natural, slightly lifted shadows, true skin: for CSR, interviews and real stories
+    x = lift_gamma_gain(x, 0.012, 1.04, 1.0)
+    x = s_curve(x, 0.15, 0.48)
+    x = split_tone(x, (0.5, 0.5, 0.5), (0.56, 0.53, 0.48), 0.04, 0.5)
+    return saturate(x, 0.92, 0.08, 0.7)
+
+
+@preset("Golden Hour")
+def _golden(x):
+    # late-afternoon warmth: honey highlights, soft contrast, glowing skin
+    x = s_curve(x, 0.3, 0.46)
+    x = highlight_rolloff(x, 0.8)
+    x = split_tone(x, (0.5, 0.48, 0.45), (0.66, 0.56, 0.4), 0.11, 0.45)
+    return saturate(x, 1.08, 0.12, 0.55)
+
+
+@preset("Bleach Bypass")
+def _bleach(x):
+    # silver retained in the print: low colour, hard contrast, gritty and dramatic
+    y = luma(x)[..., None].repeat(3, -1)
+    y = s_curve(y, 0.65, 0.45)
+    x = clamp(x * 0.5 + y * 0.5)
+    x = s_curve(x, 0.35, 0.45)
+    return saturate(x, 0.62, 0.0, 0.4)
+
+
+# ------------------------------------------------------------------ Google AI colourist: per-clip adjustments
+def apply_ai(x, p):
+    """Small, clip-specific corrections a colourist would make before the look (all values are gentle)."""
+    if not p:
+        return x
+    t = float(np.clip(p.get("temperature", 0), -1, 1)) * 0.06   # warm (+) / cool (-)
+    tint = float(np.clip(p.get("tint", 0), -1, 1)) * 0.04        # magenta (+) / green (-)
+    x = clamp(x * np.array([1 + t + tint * 0.5, 1 - tint, 1 - t + tint * 0.5]))
+    ev = float(np.clip(p.get("exposure", 0), -0.7, 0.7))
+    if abs(ev) > 0.01:
+        x = clamp(x * (2 ** ev))
+    c = float(np.clip(p.get("contrast", 0), -0.5, 0.5))
+    if abs(c) > 0.01:
+        x = s_curve(x, 0.5 * c, 0.45) if c > 0 else clamp(0.45 + (x - 0.45) * (1 + c * 0.6))
+    hl = float(np.clip(p.get("highlights", 0), -0.5, 0.5))
+    if abs(hl) > 0.01:
+        y = luma(x)[..., None]
+        x = clamp(x + hl * 0.25 * clamp((y - 0.6) / 0.4))
+    sh = float(np.clip(p.get("shadows", 0), -0.5, 0.5))
+    if abs(sh) > 0.01:
+        y = luma(x)[..., None]
+        x = clamp(x + sh * 0.2 * clamp(1 - y / 0.35))
+    s = float(np.clip(p.get("saturation", 0), -0.5, 0.5))
+    if abs(s) > 0.01:
+        x = saturate(x, 1 + s, 0.0, 0.6)
+    gr = float(np.clip(p.get("reduce_green", 0), 0, 1))  # LED/fluorescent green casts on set walls
+    if gr > 0.01:
+        x = hue_sat(x, 0.25, 0.42, 1 - 0.5 * gr)
+    return x
+
+
 # ------------------------------------------------------------------ match this look (colour transfer)
 def _rgb2lab(x):
     import cv2
@@ -240,7 +337,7 @@ def theme_tint(x, hex_color, amount=0.06):
 
 # ------------------------------------------------------------------ build + write
 def build_lut(log_profile=None, correction=None, preset_name="Vibrant Cinematic", intensity=1.0,
-              transfer=None, theme_hex=None, custom_cube=None):
+              transfer=None, theme_hex=None, custom_cube=None, ai=None):
     x = grid()
     x = decode_log(x, log_profile)
     if preset_name == "None":
@@ -248,6 +345,8 @@ def build_lut(log_profile=None, correction=None, preset_name="Vibrant Cinematic"
         return clamp(x)
     if correction:
         x = apply_correction(x, correction)
+    if ai:
+        x = apply_ai(x, ai)
     if transfer:
         x = apply_transfer(x, transfer["src"], transfer["ref"], transfer.get("strength", 0.7))
     if custom_cube:
@@ -280,15 +379,23 @@ def apply_cube(x, cube):
 
 
 def write_cube(x, path: Path, title="EventCut"):
+    """Written to a temporary file and swapped in, so a clip rendering in parallel never reads half a table."""
+    import os
+    import threading
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [f'TITLE "{title}"', f"LUT_3D_SIZE {SIZE}", "DOMAIN_MIN 0 0 0", "DOMAIN_MAX 1 1 1"]
     lines += [f"{r:.6f} {g:.6f} {b:.6f}" for r, g, b in x]
-    path.write_text("\n".join(lines) + "\n", "utf-8")
+    tmp = path.with_name(f"{path.stem}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text("\n".join(lines) + "\n", "utf-8")
+    os.replace(tmp, path)
     return path
 
 
+LUT_VERSION = 3  # bump when looks change, so old cached colour tables aren't reused
+
+
 def lut_for(**kw) -> Path:
-    key = hashlib.sha1(repr(sorted((k, repr(v)) for k, v in kw.items())).encode()).hexdigest()[:14]
+    key = hashlib.sha1((f"v{LUT_VERSION}" + repr(sorted((k, repr(v)) for k, v in kw.items()))).encode()).hexdigest()[:14]
     p = LUT_DIR / f"{key}.cube"
     if not p.exists():
         write_cube(build_lut(**kw), p, kw.get("preset_name", "EventCut"))

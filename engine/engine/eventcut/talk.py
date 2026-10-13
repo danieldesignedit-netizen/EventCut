@@ -157,7 +157,14 @@ def speaker_runs(a, t0, t1, st, sents=None, min_hold=1.4):
     runs = []
     for k, (p0, p1, sp) in enumerate(labels):
         start = t0 if k == 0 else runs[-1][1]
-        end = t1 if k == len(labels) - 1 else (p1 + labels[k + 1][0]) / 2
+        if k == len(labels) - 1:
+            end = t1
+        elif labels[k + 1][2] != sp:
+            # speaker change: the picture follows the new voice a beat later (an L-cut, how editors smooth dialogue)
+            nxt0, nxt1 = labels[k + 1][0], labels[k + 1][1]
+            end = min(nxt0 + 0.22, (nxt0 + nxt1) / 2)
+        else:
+            end = (p1 + labels[k + 1][0]) / 2
         if runs and runs[-1][2] == sp:
             runs[-1][1] = end
         else:
@@ -248,7 +255,73 @@ def _layout_runs(a, s, e, bite):
     if len(st) >= 2 and len(st) <= 3 and bite.get("establish") and out and out[0][1] - out[0][0] > 3.2:
         r0, r1, lay = out[0]
         out[0:1] = [(r0, r0 + 1.4, {"v": {"mode": "stack", "boxes": boxes}, "h": None}), (r0 + 1.4, r1, lay)]
-    return out
+    return _pro_cutting(a, out, st, boxes, bite)
+
+
+def _cut_point(sents, lo, hi):
+    """A cut inside lo..hi on a sentence or phrase break if there is one (never mid-word), else the middle."""
+    best, mid = None, (lo + hi) / 2
+    for s in sents or []:
+        for t in (s["start"], s["end"]):
+            if lo < t < hi and (best is None or abs(t - mid) < abs(best - mid)):
+                best = t
+    return best if best is not None else mid
+
+
+def _pro_cutting(a, out, st, boxes, bite):
+    """What a podcast editor does on long single-speaker stretches (tall formats):
+    - a reaction split: speaker on top, the person reacting underneath, when the room laughs or reacts
+    - a quick reaction cutaway to a listener
+    - a punch-in: the same speaker, closer, to keep energy and hide the jump
+    Each used sparingly (bite["budget"] limits splits and cutaways across the whole video)."""
+    if len(st) < 2:
+        # one person: punch-ins only
+        res = []
+        for r0, r1, lay in out:
+            v = lay.get("v") or {}
+            if v.get("mode") == "speaker" and r1 - r0 >= 5.0:
+                c = _cut_point(bite.get("sents"), r0 + 2.0, r1 - 1.5)
+                res += [(r0, c, lay), (c, r1, {"v": dict(v, tight=True), "h": lay.get("h")})]
+            else:
+                res.append((r0, r1, lay))
+        return res
+    loud = _loud(a)
+    budget = bite.setdefault("budget", {"split": 2, "cutaway": 3})
+    res = []
+    for r0, r1, lay in out:
+        v = lay.get("v") or {}
+        if v.get("mode") != "speaker" or r1 - r0 < 4.0:
+            res.append((r0, r1, lay))
+            continue
+        sp = next((i for i, b in enumerate(boxes) if b == v.get("box")), -1)
+        others = [i for i in range(len(boxes)) if i != sp]
+        # where in this stretch does the room react most (laughter, "ehn!", applause)?
+        seg = loud[int(r0 * FPS): int(r1 * FPS)] if len(loud) else np.zeros(0)
+        peak_t, peak = None, 0.0
+        if len(seg) > 20:
+            sm = _smooth(seg, int(FPS * 1.2))
+            k = int(np.argmax(sm[10:-10])) + 10 if len(sm) > 20 else 0
+            peak, peak_t = float(sm[k]), r0 + k / FPS
+        # who is the most animated listener here
+        act = _activity(a, int(r0 * FPS), max(int(r0 * FPS) + 1, int(r1 * FPS)), st)
+        lis = max(others, key=lambda i: float(np.nan_to_num(np.nanmean(act[:, i]))) if len(act) else 0) if others else None
+        pieces = [(r0, r1, lay)]
+        if peak_t and peak > 0.55 and budget["split"] > 0 and lis is not None and peak_t - r0 > 1.0 and r1 - peak_t > 1.2:
+            s0 = max(r0 + 0.8, peak_t - 0.9)
+            s1 = min(r1 - 0.6, peak_t + 1.6)
+            split = {"v": {"mode": "stack", "boxes": [boxes[sp], boxes[lis]], "order": "given"}, "h": lay.get("h")}
+            pieces = [(r0, s0, lay), (s0, s1, split), (s1, r1, {"v": dict(v, tight=True), "h": lay.get("h")})]
+            budget["split"] -= 1
+        elif r1 - r0 >= 6.0 and lis is not None and budget["cutaway"] > 0:
+            c0 = _cut_point(bite.get("sents"), r0 + 2.2, r1 - 2.0)
+            cut = {"v": {"mode": "speaker", "box": boxes[lis]}, "h": {"mode": "punch", "box": boxes[lis]}}
+            pieces = [(r0, c0, lay), (c0, min(r1 - 1.0, c0 + 0.8), cut), (min(r1 - 1.0, c0 + 0.8), r1, {"v": dict(v, tight=True), "h": lay.get("h")})]
+            budget["cutaway"] -= 1
+        elif r1 - r0 >= 5.0:
+            c = _cut_point(bite.get("sents"), r0 + 2.0, r1 - 1.5)
+            pieces = [(r0, c, lay), (c, r1, {"v": dict(v, tight=True), "h": lay.get("h")})]
+        res += [p for p in pieces if p[1] - p[0] > 0.3]
+    return res
 
 
 def plan_talk(analyses, settings, grid, transcripts=None, ai=None, rng=None, source_order=None):
@@ -286,11 +359,26 @@ def plan_talk(analyses, settings, grid, transcripts=None, ai=None, rng=None, sou
     if not cands:
         raise ValueError("No clear speech found in this footage. Turn on Captions or Google AI, or choose a non-podcast event type.")
     seed = int(settings.get("seed", 0))
+    avoid = settings.get("avoid") or []  # moments used in the previous version: regenerate should feel new
     for c in cands:  # regenerate = a different selection of equally good moments
-        c["rank"] = c["score"] + (rng.gumbel() * 0.06 if seed else 0)
+        c["rank"] = c["score"] + (rng.gumbel() * 0.12 if seed else 0)
+        if any(v.get("src") == c["src"] and c["start"] < float(v["end"]) and float(v["start"]) < c["end"] for v in avoid):
+            c["rank"] -= 0.6
 
     def overlaps(c, picked, pad=1.5):
         return any(o["src"] == c["src"] and c["start"] < o["end"] + pad and o["start"] < c["end"] + pad for o in picked)
+
+    # variety: moments from the same clip must be a real distance apart (a different part of the conversation),
+    # and every extra moment from a clip that's already used counts a little less
+    def spacing(p):
+        d = float(by_path[p].get("info", {}).get("duration") or 60)
+        return float(np.clip(d * 0.06, 15.0, 120.0))
+
+    def too_close(c, picked):
+        return any(o["src"] == c["src"] and abs(o["start"] - c["start"]) < spacing(c["src"]) for o in picked)
+
+    def spread_rank(c, picked):
+        return c["rank"] - 0.15 * sum(1 for o in picked if o["src"] == c["src"])
 
     # 1. hook: the single most gripping complete line, 3-6 s (up to 8 s if nothing shorter is strong)
     hook = None
@@ -302,29 +390,43 @@ def plan_talk(analyses, settings, grid, transcripts=None, ai=None, rng=None, sou
 
     # 2. the closer: a payoff (biggest laugh or reaction right after, or the AI's pick), so the video lands
     cliff = None
-    closers = [c for c in cands if not overlaps(c, picked) and c["end"] - c["start"] <= 12 and not c["question"]]
+    closers = [c for c in cands if not overlaps(c, picked) and not too_close(c, picked) and c["end"] - c["start"] <= 12 and not c["question"]]
     if closers:
-        cliff = max(closers, key=lambda c: c["rank"] + 0.5 * c.get("payoff", 0))
+        cliff = max(closers, key=lambda c: spread_rank(c, picked) + 0.5 * c.get("payoff", 0))
         picked.append(cliff)
 
     # 3. the story: best remaining bites until the length is filled, then in the order they were said
     used = sum(c["end"] - c["start"] for c in picked)
     story = []
-    for c in sorted(cands, key=lambda c: -c["rank"]):
-        if used >= body * 0.97:
+    ranks = sorted(c["rank"] for c in cands)
+    median = ranks[len(ranks) // 2] if ranks else 0
+    # first, the best moment from each clip that has a strong one, so one conversation doesn't take over
+    for p in by_path:
+        mine = [c for c in cands if c["src"] == p and c["rank"] >= median and c["end"] - c["start"] <= max_bite
+                and not overlaps(c, picked + story) and not too_close(c, picked + story)]
+        if mine and used < body * 0.97:
+            c = max(mine, key=lambda c: c["rank"])
+            if used + (c["end"] - c["start"]) <= body * 1.06:
+                story.append(c)
+                used += c["end"] - c["start"]
+    while used < body * 0.97:
+        free = [c for c in cands if c["end"] - c["start"] <= max_bite and not overlaps(c, picked + story)
+                and used + (c["end"] - c["start"]) <= body * 1.06]
+        spaced = [c for c in free if not too_close(c, picked + story)]
+        # short recordings: allow closer moments rather than ending far too short
+        pool = spaced or [c for c in free if not any(o["src"] == c["src"] and abs(o["start"] - c["start"]) < spacing(c["src"]) / 3
+                                                     for o in picked + story)]
+        if not pool:
             break
-        d = c["end"] - c["start"]
-        if d > max_bite or overlaps(c, picked + story):
-            continue
-        if used + d > body * 1.06:
-            continue  # too long for what's left: a shorter bite may fit
+        c = max(pool, key=lambda c: spread_rank(c, picked + story))
         story.append(c)
-        used += d
+        used += c["end"] - c["start"]
     order = {p: i for i, p in enumerate(source_order or list(by_path))}
     story.sort(key=lambda c: (order.get(c["src"], 0), c["start"]))
 
     # 4. shots, with framing per speaker
     shots = []
+    budget = {"split": 2 if body > 25 else 1, "cutaway": max(1, int(body // 15))}
     seq = ([("hook", hook)] if hook else []) + [("story", c) for c in story] + ([("close", cliff)] if cliff else [])
     for n, (section, c) in enumerate(seq):
         a = by_path[c["src"]]
@@ -338,18 +440,19 @@ def plan_talk(analyses, settings, grid, transcripts=None, ai=None, rng=None, sou
                 trans = "zoom_in"
             elif section == "close":
                 trans = "cut"
-            elif rng.random() < 0.25:
+            elif rng.random() < 0.12:  # topic changes are mostly clean cuts; an occasional move, never a pattern
                 trans = str(rng.choice(["blurwhip", "zoom_in"]))
         if trans in XF:
             s = max(0.0, s - XF[trans])  # the transition overlaps the start, so start that much earlier: no words lost
         c["establish"] = section == "story" and n == (1 if hook else 0)
+        c["budget"] = budget
         c["sents"] = [x for x in sents[c["src"]] if x["end"] > s and x["start"] < e]
         for k, (r0, r1, lay) in enumerate(_layout_runs(a, s, e, c)):
             shots.append({"src": c["src"], "kind": "video", "in": round(r0, 3), "out": round(r1, 3), "length": round(r1 - r0, 4),
                           "section": section, "face_x": 0.5, "fps": info.get("fps", 25), "log": (a.get("log") or {}).get("profile"),
                           "layouts": lay, "transition": trans if k == 0 else "cut", "quote": c.get("quote", "") if k == 0 else "",
                           "score": round(c["score"], 3), "bite": n})
-    from .story import tame_moves
+    from .story import tame_moves, music_family
     tame_moves(shots, "celebration", rng, settings.get("transition_amount", "less"))
     total = sum(s["length"] for s in shots)
     warning, shortened = None, False
@@ -361,7 +464,45 @@ def plan_talk(analyses, settings, grid, transcripts=None, ai=None, rng=None, sou
     return {"template": "talk", "order": "talk", "bpm": grid["bpm"], "shots": shots, "body": round(total, 3),
             "sections": [{"name": "hook", "start": 0, "end": round(sum(s["length"] for s in shots[:first_story]), 3)}],
             "end_card": round(max(end_len, duration - total) if not shortened else end_len, 3), "ending": ending,
-            "drop_at": round(sum(s["length"] for s in shots[:first_story]), 3), "mood": settings.get("music_mood") or "chill",
+            "drop_at": round(sum(s["length"] for s in shots[:first_story]), 3), "mood": settings.get("music_mood") or music_family(settings),
             "leaks": [], "warning": warning, "shortened": shortened,
             "bites": [{"section": sec, "src": c["src"], "start": round(c["start"], 2), "end": round(c["end"], 2), "quote": c.get("quote", "")}
                       for sec, c in seq]}
+
+
+def apply_quotes(words, bites):
+    """Caption words come from speech-to-text (good timing, weak on Pidgin); Google AI's quotes have the right words.
+    Line them up and take the AI's spelling where the two clearly refer to the same words, keeping the timing."""
+    import difflib
+    out = [dict(w) for w in words]
+    norm = lambda t: re.sub(r"[^a-z0-9']", "", t.lower())
+    for b in bites or []:
+        q = [t for t in re.findall(r"\S+", str(b.get("quote", ""))) if norm(t)]
+        idx = [i for i, w in enumerate(out) if float(b["start"]) - 0.6 <= w["start"] <= float(b["end"]) + 0.6]
+        if len(q) < 3 or len(idx) < 3:
+            continue
+        a_tok = [norm(out[i]["word"]) for i in idx]
+        sm = difflib.SequenceMatcher(None, a_tok, [norm(t) for t in q], autojunk=False)
+        if sm.ratio() < 0.35:
+            continue  # not the same passage: leave it alone
+        new, drop = {}, set()
+        for op, i1, i2, j1, j2 in sm.get_opcodes():
+            if op in ("equal", "replace") and i2 - i1 == j2 - j1:
+                for k in range(i2 - i1):
+                    out[idx[i1 + k]]["word"] = " " + q[j1 + k]
+            elif op == "replace" and max(i2 - i1, j2 - j1) <= 4:
+                # a short misheard stretch ("what the dare" for "wetin dey"): share its time among the right words
+                t0, t1 = out[idx[i1]]["start"], out[idx[i2 - 1]]["end"]
+                d = (t1 - t0) / (j2 - j1)
+                new[idx[i1]] = [{"word": " " + q[j1 + k], "start": round(t0 + k * d, 3), "end": round(t0 + (k + 1) * d - 0.02, 3)}
+                                for k in range(j2 - j1)]
+                drop.update(idx[i1:i2])
+        if new:
+            rebuilt = []
+            for i, w in enumerate(out):
+                if i in new:
+                    rebuilt += [dict(w, **x) for x in new[i]]
+                elif i not in drop:
+                    rebuilt.append(w)
+            out = rebuilt
+    return out

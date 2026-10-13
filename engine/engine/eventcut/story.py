@@ -35,9 +35,71 @@ TEMPLATES = {
 EVENT_TYPES = {
     "Watch party": "celebration", "Team bonding": "celebration", "Anniversary": "celebration",
     "End-of-year party": "celebration", "CSR": "corporate", "Product launch": "celebration",
-    "Conference": "corporate", "Award night": "celebration", "Podcast": "talk", "Vox pop": "talk",
+    "Conference": "talk", "Award night": "celebration", "Podcast": "talk", "Vox pop": "talk",
     "Interview": "talk", "Panel": "talk",
 }
+
+# Each event type edits differently: what counts as a great moment, pacing, music, look, transitions.
+# w: how much energy (cheers, applause, laughter), faces (people, emotion) and motion (dancing, action) matter.
+TRANSITION_SETS = {
+    "energetic": ["whip_l", "whip_r", "flash", "zoom_in", "blurwhip"],
+    "playful": ["whip_l", "whip_r", "slide_l", "pan_l", "pan_u", "zoom_in"],
+    "soft": ["dissolve", "dissolve", "dip", "zoom_out"],
+    "flashy": ["flash", "whip_u", "zoom_in", "tilt", "blurwhip", "whip_l"],
+    "documentary": ["dissolve", "pan_l", "slide_l"],
+    "cinematic": ["dip", "dissolve", "zoom_in", "tilt"],
+    "sleek": ["zoom_in", "tilt", "pan_l", "blurwhip"],
+    "corporate": ["blurwhip", "slide_l", "dissolve", "zoom_out", "pan_l"],
+}
+PROFILES = {
+    "Watch party":       {"template": "celebration", "music": "upbeat", "look": "Vibrant Cinematic", "pace": 0.85,
+                          "w": {"energy": 1.7, "faces": 1.2, "motion": 0.9}, "trans": "energetic", "slowmo": False, "variety": 0.93, "leaks": 3},
+    "Team bonding":      {"template": "celebration", "music": "upbeat", "look": "Warm Celebration", "pace": 1.0,
+                          "w": {"energy": 1.3, "faces": 1.3, "motion": 1.3}, "trans": "playful", "slowmo": False, "variety": 0.86, "leaks": 2},
+    "Anniversary":       {"template": "celebration", "music": "emotional", "look": "Film Print", "pace": 1.6,
+                          "w": {"energy": 0.8, "faces": 1.7, "motion": 0.5}, "trans": "soft", "slowmo": True, "variety": 0.9, "leaks": 2},
+    "End-of-year party": {"template": "celebration", "music": "upbeat", "look": "Vibrant Cinematic", "pace": 0.75,
+                          "w": {"energy": 1.4, "faces": 1.0, "motion": 1.7}, "trans": "flashy", "slowmo": False, "variety": 0.92, "leaks": 4},
+    "CSR":               {"template": "corporate", "music": "corporate", "look": "Documentary Soft", "pace": 1.5,
+                          "w": {"energy": 0.6, "faces": 1.6, "motion": 0.8}, "trans": "documentary", "slowmo": False, "variety": 0.88, "leaks": 0},
+    "Award night":       {"template": "celebration", "music": "cinematic", "look": "Cinematic Teal & Orange", "pace": 1.1,
+                          "w": {"energy": 1.7, "faces": 1.4, "motion": 0.7}, "trans": "cinematic", "slowmo": True, "variety": 0.92, "leaks": 3},
+    "Conference":        {"template": "talk", "music": "corporate", "look": "Clean Corporate", "pace": 1.0,
+                          "w": {"energy": 0.8, "faces": 1.3, "motion": 0.6}, "trans": "corporate", "slowmo": False, "variety": 0.92, "leaks": 0},
+    "Product launch":    {"template": "celebration", "music": "cinematic", "look": "Cinematic Teal & Orange", "pace": 1.0,
+                          "w": {"energy": 1.4, "faces": 0.9, "motion": 1.4}, "trans": "sleek", "slowmo": False, "variety": 0.92, "leaks": 2,
+                          "reveal": True},
+}
+DEFAULT_PROFILE = {"template": "celebration", "music": "upbeat", "look": "Vibrant Cinematic", "pace": 1.0,
+                   "w": {"energy": 1.0, "faces": 1.0, "motion": 1.0}, "trans": "energetic", "slowmo": True, "variety": 0.93, "leaks": 3}
+TALK_PROFILE = {"template": "talk", "music": "chill", "look": "Natural", "pace": 1.0, "w": {"energy": 1.0, "faces": 1.0, "motion": 1.0},
+                "trans": "documentary", "slowmo": False, "variety": 0.93, "leaks": 0}
+CORP_PROFILE = dict(PROFILES["CSR"], look="Clean Corporate", trans="corporate")
+
+
+def photo_rules(settings, analyses):
+    """Videos first, photos as occasional accents. Returns (mode, max photo shots for this length)."""
+    mode = settings.get("photos", "rarely")
+    has_video = any(a.get("kind") == "video" for a in analyses)
+    if not has_video:
+        return "normal", 10 ** 6
+    body = float(settings.get("duration", 60))
+    cap = 0 if mode == "never" else 10 ** 6 if mode == "normal" else max(1, int(body / 1.6 * 0.1))
+    if mode == "rarely":
+        # photos fill in only where the videos run short: never cut a video short when photos could finish it
+        n_video = sum(1 for a in analyses if a.get("kind") == "video" for m in a.get("moments", []) if not m.get("reject"))
+        need = int(body / 1.6) + 1
+        if n_video < need:
+            cap += need - n_video
+    return mode, cap
+
+
+def profile_for(event_type: str) -> dict:
+    if event_type in PROFILES:
+        return PROFILES[event_type]
+    t = template_for(event_type)
+    return TALK_PROFILE if t == "talk" else CORP_PROFILE if t == "corporate" else DEFAULT_PROFILE
+
 
 TALK_WORDS = ("podcast", "vox", "interview", "panel", "talk", "speech", "testimon", "q&a", "conversation")
 CORP_WORDS = ("csr", "conference", "summit", "seminar", "training", "townhall", "town hall", "workshop", "outreach", "charity")
@@ -70,6 +132,15 @@ MOOD_WORDS = {
 }
 
 
+def music_family(settings) -> str:
+    """The direction box wins ("emotional", "party"...), otherwise the event type's own music."""
+    p = (settings.get("prompt") or "").lower()
+    for mood, words in MOOD_WORDS.items():
+        if any(w in p for w in words):
+            return mood
+    return profile_for(settings.get("event_type", ""))["music"]
+
+
 def mood_from_prompt(prompt: str, template: str, rng=None) -> str:
     """Mood family for the music: upbeat, cinematic, corporate, chill or emotional."""
     p = (prompt or "").lower()
@@ -83,8 +154,12 @@ def mood_from_prompt(prompt: str, template: str, rng=None) -> str:
     return "upbeat"
 
 
-def _moment_pool(analyses, terms, transcripts, taste, rng, randomness, director=None):
+def _moment_pool(analyses, terms, transcripts, taste, rng, randomness, director=None, avoid=None, prof=None):
     director = director or {}
+    avoid = avoid or []
+    w = (prof or DEFAULT_PROFILE)["w"]
+    photo_mode = (prof or {}).get("_photos", "rarely")
+    has_video = any(a.get("kind") == "video" for a in analyses)
     pool = []
     for a in analyses:
         name = a["path"].lower()
@@ -93,6 +168,14 @@ def _moment_pool(analyses, terms, transcripts, taste, rng, randomness, director=
             if m.get("reject"):
                 continue
             s = m["score"]
+            if a.get("kind") == "photo":
+                if photo_mode == "never" and has_video:
+                    continue
+                if photo_mode != "normal" and has_video:
+                    s -= 0.35  # videos first: a photo only wins when it's clearly better than the video moments left
+            # what this kind of event cares about: cheers and applause, faces and emotion, dancing and action
+            s += 0.22 * (w["energy"] - 1) * m.get("energy", 0) + 0.18 * (w["faces"] - 1) * min(1, m.get("faces", 0) / 2) \
+                + 0.15 * (w["motion"] - 1) * min(1, m.get("motion", 0) * 12)
             hit = 0
             if terms:
                 hit += sum(1 for t in terms if t in name) * 0.3
@@ -104,6 +187,8 @@ def _moment_pool(analyses, terms, transcripts, taste, rng, randomness, director=
                      + taste.get("motion", 0) * min(1, m.get("motion", 0) * 12) + taste.get("photo", 0) * (1 if m.get("photo") else 0)
                 s += taste.get("sources", {}).get(a["path"], 0)
             s += rng.gumbel() * randomness  # regenerate = different picks
+            if any(v.get("src") == a["path"] and m["start"] < float(v["end"]) and float(v["start"]) < m["end"] for v in avoid):
+                s -= 0.45  # used in the previous version: prefer something new
             d = director.get(f"{a['path']}|{i}")
             if d:
                 s += d["boost"]
@@ -117,8 +202,14 @@ def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
     """Return {sections, shots, total} where every shot length is a whole number of beats."""
     if template_for(settings.get("event_type", "")) == "talk" and settings.get("talk_mode", True):
         from . import talk
-        return talk.plan_talk(analyses, settings, grid, transcripts, settings.get("_ai"),
-                              source_order=source_order([a for a in analyses if a.get("kind") == "video"]))
+        try:
+            return talk.plan_talk(analyses, settings, grid, transcripts, settings.get("_ai"),
+                                  source_order=source_order([a for a in analyses if a.get("kind") == "video"]))
+        except ValueError:
+            if settings.get("event_type") in ("Podcast", "Interview", "Panel", "Vox pop"):
+                raise
+            # e.g. a conference with no clear speech: edit it like an event instead of failing
+            settings = dict(settings, event_type="corporate summit")
     if settings.get("order", "chronological") == "chronological":
         return plan_chronological(analyses, settings, grid, transcripts, taste)
     transcripts = transcripts or {}
@@ -132,7 +223,8 @@ def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
     rng = np.random.default_rng(seed)
     terms = prompt_terms(settings.get("prompt", ""))
     pool = _moment_pool(analyses, terms, transcripts, taste, rng, randomness=0.12 if seed else 0.02,
-                        director=settings.get("director_picks"))
+                        director=settings.get("director_picks"), avoid=settings.get("avoid"),
+                        prof=dict(profile_for(settings.get("event_type", "")), _photos=photo_rules(settings, analyses)[0]))
     if not pool:
         raise ValueError("No usable shots found. The footage may be too dark, blurry or shaky.")
 
@@ -154,6 +246,7 @@ def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
     bounds[-1][2] = body  # last section absorbs rounding
 
     used, used_src_time, used_order, used_sigs = set(), [], [], []
+    _, photo_cap = photo_rules(settings, analyses)
     from .analyze import similarity
     locks = {(l["src"], round(l["start"], 2)): l for l in settings.get("locks", [])}
     shots = []
@@ -185,9 +278,12 @@ def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
                 t += need
                 continue
             best, best_s = None, -1e9
+            n_photos = sum(1 for x in shots + section_shots if x.get("kind") == "photo")
             for c in pool:
                 key = (c["src"], c["idx"])
                 if key in used:
+                    continue
+                if c["kind"] == "photo" and (n_photos >= photo_cap or (name == "hook" and photo_cap < 10 ** 6)):
                     continue
                 m = c["m"]
                 avail = m["end"] - m["start"]
@@ -257,7 +353,7 @@ def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
     peak_start = next((b[1] for b in bounds if b[0] == "peak"), body * 0.35)
     return {"template": tmpl_name, "bpm": grid["bpm"], "sections": [{"name": b[0], "start": b[1], "end": b[2]} for b in bounds],
             "shots": shots, "body": round(total, 3), "end_card": round(duration - total, 3), "drop_at": round(peak_start, 3),
-            "mood": settings.get("music_mood") or mood_from_prompt(settings.get("prompt", ""), tmpl_name, rng),
+            "mood": settings.get("music_mood") or music_family(settings),
             "leaks": pick_leaks(shots, rng, tmpl_name), "warning": warning, "shortened": bool(warning), "order": "highlights"}
 
 
@@ -411,12 +507,15 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
     seed = int(settings.get("seed", 0))
     rng = np.random.default_rng(seed)
     pool = _moment_pool(analyses, prompt_terms(settings.get("prompt", "")), transcripts, taste, rng,
-                        randomness=0.12 if seed else 0.02, director=settings.get("director_picks"))
+                        randomness=0.12 if seed else 0.02, director=settings.get("director_picks"), avoid=settings.get("avoid"),
+                        prof=dict(profile_for(settings.get("event_type", "")), _photos=photo_rules(settings, analyses)[0]))
     if not pool:
         raise ValueError("No usable shots found. The footage may be too dark, blurry or shaky.")
     beat = 60.0 / grid["bpm"]
     style = settings.get("style") or {}
+    prof = profile_for(settings.get("event_type", ""))
     pace = float(np.clip(style.get("median_shot", 0.55) / 0.55, 0.5, 3.0)) if style.get("median_shot") else 1.0
+    pace *= prof["pace"]
     if tmpl_name == "talk":
         pace = max(pace, 2.5)
 
@@ -426,6 +525,7 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
     good = [c for c in pool if c["score"] >= cutoff or c["prompt_hit"] > 0]
 
     chosen, hook = [], []
+    _, photo_cap = photo_rules(settings, analyses)
 
     def too_similar(c, picked, limit):
         sig = c["m"].get("sig")
@@ -441,6 +541,8 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
         avail = c["m"]["end"] - c["m"]["start"]
         if (c["kind"] != "photo" and avail < hb) or too_similar(c, hook, 0.82):
             continue
+        if c["kind"] == "photo" and photo_cap < 10 ** 6:
+            continue  # the opening is always moving footage
         if sum(1 for h in hook if h["src"] == c["src"]) >= max(1, len(hook) // 2):
             continue  # spread the hook across clips
         hook.append(c)
@@ -459,13 +561,15 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
         L = _shot_len(m, beat, pace)
         if L <= 0:
             continue
+        if c["kind"] == "photo" and sum(1 for o in chosen if o["kind"] == "photo") >= photo_cap:
+            continue
         key = (c["src"], m.get("scene", 0))
         cap = 1 + int(m.get("scene_len", 0) // 7)  # long takes may give a few moments, short scenes one
         if per_scene.get(key, 0) >= cap:
             continue
         if any(o["src"] == c["src"] and abs(o["m"]["start"] - m["start"]) < 2.5 for o in chosen):
             continue  # moments from the same stretch of a clip look like a repeat
-        if too_similar(c, [o for o in chosen if (o["src"], o["m"].get("scene", 0)) != key], 0.93):
+        if too_similar(c, [o for o in chosen if (o["src"], o["m"].get("scene", 0)) != key], prof.get("variety", 0.93)):
             continue  # same person/place in another clip
         c["len"] = L
         chosen.append(c)
@@ -482,6 +586,11 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
 
     order = {p: i for i, p in enumerate(source_order(analyses))}
     chosen.sort(key=lambda o: (order.get(o["src"], 0), o["m"]["start"]))
+    if prof.get("reveal") and len(chosen) > 3:
+        # product launch: build up, then land on the biggest moment (the reveal) at the end
+        big = max(chosen, key=lambda o: o["m"].get("energy", 0) + min(1, o["m"].get("motion", 0) * 12) + 0.5 * o["score"])
+        chosen.remove(big)
+        chosen.append(big)
 
     def shot(c, length, section):
         m = c["m"]
@@ -505,27 +614,27 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
         shortened = True
         warning = (f"There were only enough interesting moments for about {int(round(total + end_card))} seconds, "
                    f"so the video is shorter than {int(duration)} seconds instead of repeating shots. Add more footage for a longer cut.")
-    assign_transitions_chrono(shots, tmpl_name, rng, settings.get("transition_amount", "normal"))
+    assign_transitions_chrono(shots, tmpl_name, rng, settings.get("transition_amount", "normal"), TRANSITION_SETS.get(prof["trans"]))
     tame_moves(shots, tmpl_name, rng, settings.get("transition_amount", "normal"))
     leaks, tt = [], 0.0
     for i, s in enumerate(shots):
-        if i and s["transition"] != "cut" and len(leaks) < 4 and (s["section"] != shots[i - 1]["section"] or rng.random() < 0.3):
+        if i and s["transition"] != "cut" and len(leaks) < prof.get("leaks", 4) and (s["section"] != shots[i - 1]["section"] or rng.random() < 0.3):
             leaks.append({"at": round(max(0.0, tt - 0.25), 3), "style": int(rng.integers(0, 4))})
         tt += s["length"]
     if tmpl_name == "talk":
         leaks = []
-    return {"template": tmpl_name, "order": "chronological", "bpm": grid["bpm"],
+    return {"template": tmpl_name, "order": "chronological", "bpm": grid["bpm"], "slowmo": prof.get("slowmo", True), "profile": prof["trans"],
             "sections": [{"name": "hook", "start": 0, "end": round(hook_len, 3)}, {"name": "story", "start": round(hook_len, 3), "end": round(total, 3)}],
             "shots": shots, "body": round(total, 3), "end_card": round(end_card if shortened else max(end_card, duration - total), 3),
             "drop_at": round(hook_len, 3) if hook_len else round(min(total * 0.3, 8 * beat * 4), 3),
-            "mood": settings.get("music_mood") or mood_from_prompt(settings.get("prompt", ""), tmpl_name, rng),
+            "mood": settings.get("music_mood") or music_family(settings),
             "leaks": leaks, "warning": warning, "shortened": shortened}
 
 
-def assign_transitions_chrono(shots, tmpl_name, rng, amount="normal"):
+def assign_transitions_chrono(shots, tmpl_name, rng, amount="normal", fam=None):
     """Cuts on the beat inside a clip; accents where the story moves to the next clip; a punchy accent out of the hook."""
-    fam = {"celebration": ["whip_l", "whip_r", "blurwhip", "zoom", "flash", "slide_l", "tilt", "zoom_in", "zoom_out", "pan_l", "pan_u"],
-           "corporate": ["blurwhip", "slide_l", "dissolve", "zoom", "tilt", "zoom_out", "pan_l"], "talk": ["dissolve"]}.get(tmpl_name, ["whip_l", "blurwhip", "zoom"])
+    fam = fam or {"celebration": ["whip_l", "whip_r", "blurwhip", "zoom", "flash", "slide_l", "tilt", "zoom_in", "zoom_out", "pan_l", "pan_u"],
+                  "corporate": ["blurwhip", "slide_l", "dissolve", "zoom", "tilt", "zoom_out", "pan_l"], "talk": ["dissolve"]}.get(tmpl_name, ["whip_l", "blurwhip", "zoom"])
     within_every = {"less": 0, "normal": 0, "more": 4}.get(amount, 0)
     accent_chance = {"less": 0.5, "normal": 0.85, "more": 1.0}.get(amount, 0.85)
     since = 0
@@ -535,7 +644,7 @@ def assign_transitions_chrono(shots, tmpl_name, rng, amount="normal"):
             continue
         prev = shots[i - 1]
         if prev["section"] == "hook" and s["section"] != "hook":
-            s["transition"] = str(rng.choice(["flash", "zoom_in", "whip_u", "tilt"])) if tmpl_name != "talk" else "dissolve"
+            s["transition"] = str(rng.choice([t for t in fam if t not in ("dissolve", "dip")] or fam)) if tmpl_name != "talk" else "dissolve"
             since = 0
         elif s["src"] != prev["src"] and prev["section"] != "hook" and s["section"] != "hook":
             if rng.random() < accent_chance and prev["length"] >= 0.45 and s["length"] >= 0.45:

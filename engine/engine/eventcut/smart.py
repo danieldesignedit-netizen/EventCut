@@ -1,6 +1,7 @@
 """Speech transcription, reference Styles, Director mode (optional cloud AI) and the shoot guide."""
 import base64
 import json
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -21,6 +22,10 @@ def whisper_available() -> bool:
         return True
     except Exception:
         return False
+
+
+PIDGIN_PROMPT = ("Oya, make we start. Wetin dey happen? Abeg no vex, na so e be. I dey tell you, dem no sabi. "
+                 "Wahala dey o! Na wa for this match. Una go see am. E don do, comot for there. Abi you no hear?")
 
 
 class Skipped(Exception):
@@ -63,18 +68,46 @@ def transcribe(path: str, key: str, progress=None) -> list:
 
     progress(fraction, note) is called often; it may raise Skipped (keep partial words) or InterruptedError (cancel)."""
     TRANS_CACHE.mkdir(parents=True, exist_ok=True)
-    out = TRANS_CACHE / f"{key}.json"
+    lang = load_settings().get("speech_language", "pcm")
+    out = TRANS_CACHE / (f"{key}.json" if lang == "en" else f"{key}_{lang}.json")
     if out.exists():
         return json.loads(out.read_text("utf-8"))
+    if lang != "en":  # an English transcript made earlier is still a good start (and keeps any caption fixes)
+        old = TRANS_CACHE / f"{key}.json"
+        if old.exists() and not speech_available():
+            return json.loads(old.read_text("utf-8"))
+    from . import falai
+    if falai.enabled():  # fal: the same Whisper on cloud graphics cards, minutes instead of hours
+        try:
+            words = falai.transcribe(path, PIDGIN_PROMPT if lang == "pcm" else "", progress)
+            out.write_text(json.dumps(words), "utf-8")
+            return words
+        except Skipped:
+            return []
+        except falai.FalError as e:
+            print("fal speech-to-text not used:", e)
+            if "key" in str(e) or "credit" in str(e):
+                falai.mark_broken(str(e))
     if not whisper_available():
         return []
+    with _WLOCK:  # one local listen at a time (if fal stopped mid-run, clips queue here)
+        return _transcribe_local(path, out, lang, progress)
+
+
+_WLOCK = threading.Lock()
+
+
+def _transcribe_local(path, out, lang, progress):
     if progress:
         progress(0.0, "Taking out the sound")
     audio16 = _audio_16k(path)
     total = len(audio16) / 16000 or 1
     device, model = _load_whisper()
+    extra = {}
+    if lang == "pcm":  # Nigerian Pidgin + English: show the model how people speak, so it spells Pidgin as Pidgin
+        extra = {"language": "en", "initial_prompt": PIDGIN_PROMPT}
     segments, _ = model.transcribe(audio16, word_timestamps=True, vad_filter=True, beam_size=1, best_of=1,
-                                   condition_on_previous_text=False, vad_parameters={"min_silence_duration_ms": 500})
+                                   condition_on_previous_text=False, vad_parameters={"min_silence_duration_ms": 500}, **extra)
     words, skipped = [], False
     try:
         for seg in segments:
@@ -91,10 +124,24 @@ def transcribe(path: str, key: str, progress=None) -> list:
     return words
 
 
+def speech_available() -> bool:
+    """Speech-to-text on this PC (Whisper) or on fal."""
+    from . import falai
+    return whisper_available() or falai.enabled()
+
+
+def transcript_path(key: str) -> Path:
+    """Where this clip's transcript lives for the PC's speech setting (English, or Pidgin + English)."""
+    lang = load_settings().get("speech_language", "pcm")
+    p = TRANS_CACHE / (f"{key}.json" if lang == "en" else f"{key}_{lang}.json")
+    old = TRANS_CACHE / f"{key}.json"
+    return p if p.exists() or not old.exists() else old
+
+
 def save_transcript(key: str, words: list):
     """Edits from the transcript editor overwrite the cached transcript."""
     TRANS_CACHE.mkdir(parents=True, exist_ok=True)
-    (TRANS_CACHE / f"{key}.json").write_text(json.dumps(words), "utf-8")
+    transcript_path(key).write_text(json.dumps(words), "utf-8")
 
 
 # ------------------------------------------------------------------ reference Styles

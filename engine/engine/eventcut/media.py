@@ -124,7 +124,7 @@ def make_proxy(src: str, dst: Path, height: int = 360, fps: int = 10) -> Path:
     if is_hdr(info):
         vf.insert(0, "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
     cmd = [ffmpeg, "-y", "-v", "error"] + decode_args() + ["-i", src, "-vf", ",".join(vf), "-an",
-           "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", str(dst)]
+           "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-pix_fmt", "yuv420p", str(dst)]  # 8-bit: plays in any browser
     try:
         run_decoding(cmd)
     except RuntimeError:
