@@ -16,6 +16,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check the folder layout and read the version
+        id: ver
+        shell: pwsh
+        run: |
+          if (Test-Path engine/engine) {
+            Write-Error "There is an 'engine' folder inside the 'engine' folder (engine/engine). Delete engine/engine on GitHub, then upload the engine folder from the top level of the repository, so the files land in engine/eventcut, engine/build and so on."
+            exit 1
+          }
+          $m = Select-String -Path engine/eventcut/config.py -Pattern 'VERSION = "([^"]+)"'
+          if (-not $m) { Write-Error "engine/eventcut/config.py has no VERSION line."; exit 1 }
+          $v = $m.Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "Building EventCut Engine $v"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -62,8 +76,8 @@ jobs:
       - name: Publish the release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.${{ github.run_number }}
-          name: EventCut Engine 1.0.${{ github.run_number }}
+          tag_name: v${{ steps.ver.outputs.version }}-build${{ github.run_number }}
+          name: EventCut Engine ${{ steps.ver.outputs.version }}
           body: |
             Download **EventCut-Engine-Setup.exe** below and run it. Windows may show "Windows protected your PC": click **More info**, then **Run anyway**.
           files: engine/build/Output/EventCut-Engine-Setup.exe
