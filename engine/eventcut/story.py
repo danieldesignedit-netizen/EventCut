@@ -77,6 +77,23 @@ TALK_PROFILE = {"template": "talk", "music": "chill", "look": "Natural", "pace":
 CORP_PROFILE = dict(PROFILES["CSR"], look="Clean Corporate", trans="corporate")
 
 
+def photo_rules(settings, analyses):
+    """Videos first, photos as occasional accents. Returns (mode, max photo shots for this length)."""
+    mode = settings.get("photos", "rarely")
+    has_video = any(a.get("kind") == "video" for a in analyses)
+    if not has_video:
+        return "normal", 10 ** 6
+    body = float(settings.get("duration", 60))
+    cap = 0 if mode == "never" else 10 ** 6 if mode == "normal" else max(1, int(body / 1.6 * 0.1))
+    if mode == "rarely":
+        # photos fill in only where the videos run short: never cut a video short when photos could finish it
+        n_video = sum(1 for a in analyses if a.get("kind") == "video" for m in a.get("moments", []) if not m.get("reject"))
+        need = int(body / 1.6) + 1
+        if n_video < need:
+            cap += need - n_video
+    return mode, cap
+
+
 def profile_for(event_type: str) -> dict:
     if event_type in PROFILES:
         return PROFILES[event_type]
@@ -141,6 +158,8 @@ def _moment_pool(analyses, terms, transcripts, taste, rng, randomness, director=
     director = director or {}
     avoid = avoid or []
     w = (prof or DEFAULT_PROFILE)["w"]
+    photo_mode = (prof or {}).get("_photos", "rarely")
+    has_video = any(a.get("kind") == "video" for a in analyses)
     pool = []
     for a in analyses:
         name = a["path"].lower()
@@ -149,6 +168,11 @@ def _moment_pool(analyses, terms, transcripts, taste, rng, randomness, director=
             if m.get("reject"):
                 continue
             s = m["score"]
+            if a.get("kind") == "photo":
+                if photo_mode == "never" and has_video:
+                    continue
+                if photo_mode != "normal" and has_video:
+                    s -= 0.35  # videos first: a photo only wins when it's clearly better than the video moments left
             # what this kind of event cares about: cheers and applause, faces and emotion, dancing and action
             s += 0.22 * (w["energy"] - 1) * m.get("energy", 0) + 0.18 * (w["faces"] - 1) * min(1, m.get("faces", 0) / 2) \
                 + 0.15 * (w["motion"] - 1) * min(1, m.get("motion", 0) * 12)
@@ -200,7 +224,7 @@ def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
     terms = prompt_terms(settings.get("prompt", ""))
     pool = _moment_pool(analyses, terms, transcripts, taste, rng, randomness=0.12 if seed else 0.02,
                         director=settings.get("director_picks"), avoid=settings.get("avoid"),
-                        prof=profile_for(settings.get("event_type", "")))
+                        prof=dict(profile_for(settings.get("event_type", "")), _photos=photo_rules(settings, analyses)[0]))
     if not pool:
         raise ValueError("No usable shots found. The footage may be too dark, blurry or shaky.")
 
@@ -222,6 +246,7 @@ def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
     bounds[-1][2] = body  # last section absorbs rounding
 
     used, used_src_time, used_order, used_sigs = set(), [], [], []
+    _, photo_cap = photo_rules(settings, analyses)
     from .analyze import similarity
     locks = {(l["src"], round(l["start"], 2)): l for l in settings.get("locks", [])}
     shots = []
@@ -253,9 +278,12 @@ def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
                 t += need
                 continue
             best, best_s = None, -1e9
+            n_photos = sum(1 for x in shots + section_shots if x.get("kind") == "photo")
             for c in pool:
                 key = (c["src"], c["idx"])
                 if key in used:
+                    continue
+                if c["kind"] == "photo" and (n_photos >= photo_cap or (name == "hook" and photo_cap < 10 ** 6)):
                     continue
                 m = c["m"]
                 avail = m["end"] - m["start"]
@@ -480,7 +508,7 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
     rng = np.random.default_rng(seed)
     pool = _moment_pool(analyses, prompt_terms(settings.get("prompt", "")), transcripts, taste, rng,
                         randomness=0.12 if seed else 0.02, director=settings.get("director_picks"), avoid=settings.get("avoid"),
-                        prof=profile_for(settings.get("event_type", "")))
+                        prof=dict(profile_for(settings.get("event_type", "")), _photos=photo_rules(settings, analyses)[0]))
     if not pool:
         raise ValueError("No usable shots found. The footage may be too dark, blurry or shaky.")
     beat = 60.0 / grid["bpm"]
@@ -497,6 +525,7 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
     good = [c for c in pool if c["score"] >= cutoff or c["prompt_hit"] > 0]
 
     chosen, hook = [], []
+    _, photo_cap = photo_rules(settings, analyses)
 
     def too_similar(c, picked, limit):
         sig = c["m"].get("sig")
@@ -512,6 +541,8 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
         avail = c["m"]["end"] - c["m"]["start"]
         if (c["kind"] != "photo" and avail < hb) or too_similar(c, hook, 0.82):
             continue
+        if c["kind"] == "photo" and photo_cap < 10 ** 6:
+            continue  # the opening is always moving footage
         if sum(1 for h in hook if h["src"] == c["src"]) >= max(1, len(hook) // 2):
             continue  # spread the hook across clips
         hook.append(c)
@@ -529,6 +560,8 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
         m = c["m"]
         L = _shot_len(m, beat, pace)
         if L <= 0:
+            continue
+        if c["kind"] == "photo" and sum(1 for o in chosen if o["kind"] == "photo") >= photo_cap:
             continue
         key = (c["src"], m.get("scene", 0))
         cap = 1 + int(m.get("scene_len", 0) // 7)  # long takes may give a few moments, short scenes one

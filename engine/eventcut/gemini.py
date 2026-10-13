@@ -8,6 +8,7 @@ closing payoff. Results are saved per clip, so regenerating or changing settings
 import hashlib
 import json
 import os
+import threading
 import re
 import time
 import urllib.error
@@ -43,7 +44,28 @@ def enabled() -> bool:
 
 
 # ------------------------------------------------------------------ HTTP
+_wait_note = threading.local()  # set by the caller to show "waiting for internet" in the progress bar
+NET_WAIT_MAX = 45 * 60  # keep waiting for a lost connection for up to 45 minutes
+
+
 def _req(method, url, key, body=None, headers=None, timeout=120, raw=False):
+    """A request that survives internet drops: it waits and tries again rather than failing the video."""
+    waited, delay = 0.0, 5.0
+    while True:
+        try:
+            return _req_once(method, url, key, body, headers, timeout, raw)
+        except AIError as e:
+            if not str(e).startswith("Couldn't reach Google AI") or waited >= getattr(_wait_note, "max", NET_WAIT_MAX):
+                raise
+            note = getattr(_wait_note, "fn", None)
+            if note:
+                note(f"Waiting for the internet to come back (tried for {int(waited // 60)} min)")
+            time.sleep(delay)
+            waited += delay
+            delay = min(60.0, delay * 1.6)
+
+
+def _req_once(method, url, key, body=None, headers=None, timeout=120, raw=False):
     h = {"x-goog-api-key": key, **(headers or {})}
     data = None
     if body is not None:
@@ -67,8 +89,8 @@ def _req(method, url, key, body=None, headers=None, timeout=120, raw=False):
         if e.code == 429:
             raise AIError("Google AI's usage limit was reached. Wait a minute, or turn on billing for the key to raise limits.")
         raise AIError(f"Google AI error ({e.code}): {msg[:300]}")
-    except urllib.error.URLError as e:
-        raise AIError(f"Couldn't reach Google AI. Check the internet connection. ({e.reason})")
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+        raise AIError(f"Couldn't reach Google AI. Check the internet connection. ({getattr(e, 'reason', e)})")
 
 
 # ------------------------------------------------------------------ models
@@ -283,8 +305,10 @@ def analyse_clip(path, event_type, duration_s, key_for_cache, progress=None):
         return json.loads(out.read_text("utf-8"))
     if month_spend() >= c["cap"]:
         raise AIError(f"Google AI has reached this month's spending cap (US${c['cap']:.0f}). Raise it in Settings.")
-    model = pick_model(c["key"], c["tier"])
     say = progress or (lambda f, note="": None)
+    _wait_note.fn = lambda note: say(0.05, note)
+    _wait_note.max = NET_WAIT_MAX  # picking the moments is worth waiting for
+    model = pick_model(c["key"], c["tier"])
     say(0.02, "Making a small copy for Google AI")
     copy = make_ai_copy(path, CACHE / f"{key_for_cache}_ai.mp4")
     say(0.1, "Sending it to Google AI")
@@ -357,6 +381,7 @@ def colourist(frame_jpg, look, event_type, cache_tag):
         return json.loads(out.read_text("utf-8"))
     if month_spend() >= c["cap"]:
         raise AIError("Google AI has reached this month's spending cap.")
+    _wait_note.max = 120  # colour is a finishing touch: wait a couple of minutes for the internet, then skip
     model = pick_model(c["key"], c["tier"])
     data = base64.b64encode(Path(frame_jpg).read_bytes()).decode()
     body = {"contents": [{"role": "user", "parts": [{"inline_data": {"mime_type": "image/jpeg", "data": data}},
@@ -377,3 +402,104 @@ def colourist(frame_jpg, look, event_type, cache_tag):
     p["note"] = str(d.get("note", ""))[:200]
     out.write_text(json.dumps(p), "utf-8")
     return p
+
+
+# ------------------------------------------------------------------ sorting mixed-up footage by event
+SORT_VERSION = "s1"
+
+
+def _images_request(images, text, schema):
+    """One request with several JPEG images. Returns parsed JSON."""
+    import base64
+    c = cfg()
+    if not c["key"]:
+        raise AIError("Add a Google AI key in Settings to sort with Google AI.")
+    if month_spend() >= c["cap"]:
+        raise AIError("Google AI has reached this month's spending cap.")
+    _wait_note.max = 300
+    model = pick_model(c["key"], c["tier"])
+    parts = [{"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(b).decode()}} for b in images]
+    parts.append({"text": text})
+    body = {"contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {"temperature": 0.1, "response_mime_type": "application/json", "response_schema": schema}}
+    try:
+        resp = _req("POST", f"{API}/v1beta/models/{model}:generateContent", c["key"], body=body, timeout=180)
+    except AIError as e:
+        if "(400)" not in str(e):
+            raise
+        body["generationConfig"].pop("response_schema", None)
+        resp = _req("POST", f"{API}/v1beta/models/{model}:generateContent", c["key"], body=body, timeout=180)
+    log_spend(resp.get("usageMetadata", {}), c["tier"])
+    return _json_from(resp)
+
+
+def _project_line(event, hint):
+    return f'The project is a video of this event: "{event or "a company event"}".' + (f' The editor describes it as: "{hint}".' if hint else "")
+
+
+OVERVIEW_SCHEMA = {"type": "OBJECT", "properties": {
+    "events": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+        "id": {"type": "STRING"}, "label": {"type": "STRING"}, "clues": {"type": "STRING"},
+        "matches": {"type": "STRING", "enum": ["yes", "no", "unsure"]}, "why": {"type": "STRING"},
+        "groups": {"type": "ARRAY", "items": {"type": "STRING"}}},
+        "required": ["id", "label", "clues", "matches", "why", "groups"]}}},
+    "required": ["events"]}
+
+
+def sort_overview(overview, event, hint):
+    """overview: [(group, sheet_jpeg)]. Names the distinct events in the footage, e.g.
+    [{"id": "e1", "label": "CSR school visit", "clues": "...", "matches": "yes", "why": "...", "groups": ["g1"]}]"""
+    text = f"""EVENTCUT_SORT_OVERVIEW
+{_project_line(event, hint)}
+Someone mixed footage from different events into one folder. Each image is a contact sheet of one recording session;
+the label on every thumbnail is the session id ({", ".join(g["id"] for g, _ in overview)}). Sessions, in the same order as the images:
+""" + "\n".join(f'- {g["id"]}: {time.strftime("%a %d %b %Y %H:%M", time.localtime(g["start"]))} to {time.strftime("%H:%M", time.localtime(g["end"]))}, '
+                f'folders: {", ".join(f for f, _ in g.get("folders", [])) or "-"}' for g, _ in overview) + """
+
+Work out how many different events this footage shows (different venue, decor, banners, dress code, activity or audience).
+Several sessions can be the same event. Give each event:
+- id: e1, e2, ...
+- label: a short name a person would recognise ("Beach clean-up, branded green tees", "CST week quiz in the office hall")
+- clues: what tells this event apart from the others (backdrop, banners, clothing, venue, activity). Be concrete; this is used to check every file later.
+- matches: "yes" if this is the event of the project, "no" if it clearly is not, "unsure" otherwise
+- why: one short sentence
+- groups: the session ids that belong to it
+Folder names are useful clues but can be wrong."""
+    d = _images_request([s for _, s in overview], text, OVERVIEW_SCHEMA)
+    evs = []
+    for i, e in enumerate(d.get("events") or []):
+        evs.append({"id": str(e.get("id") or f"e{i + 1}"), "label": str(e.get("label", ""))[:80], "clues": str(e.get("clues", ""))[:300],
+                    "matches": e.get("matches") if e.get("matches") in ("yes", "no", "unsure") else "unsure",
+                    "why": str(e.get("why", ""))[:200], "groups": [str(x) for x in e.get("groups") or []]})
+    if not evs:
+        raise AIError("Google AI couldn't tell the events apart.")
+    return evs
+
+
+FILES_SCHEMA = {"type": "OBJECT", "properties": {
+    "files": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+        "n": {"type": "INTEGER"}, "event": {"type": "STRING"}}, "required": ["n", "event"]}}},
+    "required": ["files"]}
+
+
+def sort_files(sheets, nums, events, event, hint):
+    """Assigns every numbered thumbnail to one of the named events. Returns {number: event_id or "unsure"}."""
+    text = f"""EVENTCUT_SORT_FILES
+{_project_line(event, hint)}
+The footage contains these events:
+""" + "\n".join(f'- {e["id"]}: {e["label"]}. Clues: {e["clues"]}' for e in events) + f"""
+
+Each image is a contact sheet; every thumbnail has a number. For every number ({nums[0]} to {nums[-1]}, {len(nums)} in total),
+say which event it shows: one of {", ".join(e["id"] for e in events)}, or "unsure" when the picture has no clue
+(dark, blurry, a close-up with no background). Return every number exactly once."""
+    d = _images_request(sheets, text, FILES_SCHEMA)
+    ok = {e["id"] for e in events}
+    out = {}
+    for f in d.get("files") or []:
+        try:
+            n = int(f.get("n"))
+        except Exception:
+            continue
+        ev = str(f.get("event", "unsure"))
+        out[n] = ev if ev in ok else "unsure"
+    return out

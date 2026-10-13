@@ -278,7 +278,14 @@ class Renderer:
             vf.append("noise=alls=3:allf=t")
         vf += ["setsar=1", "format=yuv420p", f"trim=duration={length:.3f}", "setpts=PTS-STARTPTS"]
         has_audio = shot["kind"] != "photo" and info.get("has_audio")
-        if has_audio:
+        rec = (self.s.get("audio_sync") or {}).get(src) if shot["kind"] != "photo" else None
+        if rec and has_audio and "setpts=" not in ",".join(vf) and Path(rec["audio"]).exists():
+            # the separately recorded sound (lapel / recorder / desk) in place of the camera mic, room sound underneath
+            af = f"aresample=48000,aformat=channel_layouts=stereo,apad,atrim=duration={length:.3f}"
+            args += ["-ss", f"{max(0.0, rec['offset'] + shot['in']):.3f}", "-t", f"{length:.3f}", "-i", rec["audio"]]
+            args += ["-filter_complex", f"[0:v]{','.join(vf)}[v];[1:a]{af}[r];[0:a]{af},volume=0.25[c];"
+                                        f"[r][c]amix=inputs=2:duration=first:normalize=0[a]", "-map", "[v]", "-map", "[a]"]
+        elif has_audio:
             af = f"aresample=48000,aformat=channel_layouts=stereo,apad,atrim=duration={length:.3f}"
             args += ["-filter_complex", f"[0:v]{','.join(vf)}[v];[0:a]{af}[a]", "-map", "[v]", "-map", "[a]"]
         else:

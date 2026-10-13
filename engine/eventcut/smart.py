@@ -1,6 +1,7 @@
 """Speech transcription, reference Styles, Director mode (optional cloud AI) and the shoot guide."""
 import base64
 import json
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -73,10 +74,30 @@ def transcribe(path: str, key: str, progress=None) -> list:
         return json.loads(out.read_text("utf-8"))
     if lang != "en":  # an English transcript made earlier is still a good start (and keeps any caption fixes)
         old = TRANS_CACHE / f"{key}.json"
-        if old.exists() and not whisper_available():
+        if old.exists() and not speech_available():
             return json.loads(old.read_text("utf-8"))
+    from . import falai
+    if falai.enabled():  # fal: the same Whisper on cloud graphics cards, minutes instead of hours
+        try:
+            words = falai.transcribe(path, PIDGIN_PROMPT if lang == "pcm" else "", progress)
+            out.write_text(json.dumps(words), "utf-8")
+            return words
+        except Skipped:
+            return []
+        except falai.FalError as e:
+            print("fal speech-to-text not used:", e)
+            if "key" in str(e) or "credit" in str(e):
+                falai.mark_broken(str(e))
     if not whisper_available():
         return []
+    with _WLOCK:  # one local listen at a time (if fal stopped mid-run, clips queue here)
+        return _transcribe_local(path, out, lang, progress)
+
+
+_WLOCK = threading.Lock()
+
+
+def _transcribe_local(path, out, lang, progress):
     if progress:
         progress(0.0, "Taking out the sound")
     audio16 = _audio_16k(path)
@@ -101,6 +122,12 @@ def transcribe(path: str, key: str, progress=None) -> list:
     if not skipped:  # only cache complete transcripts
         out.write_text(json.dumps(words), "utf-8")
     return words
+
+
+def speech_available() -> bool:
+    """Speech-to-text on this PC (Whisper) or on fal."""
+    from . import falai
+    return whisper_available() or falai.enabled()
 
 
 def transcript_path(key: str) -> Path:
