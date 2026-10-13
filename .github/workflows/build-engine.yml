@@ -71,7 +71,7 @@ jobs:
         run: |
           if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" build\eventcut.iss
-          Get-Item build\Output\EventCut-Engine-Setup.exe | Select-Object Name, Length
+          Get-Item build\Output\EventCut-Engine-Setup-*.exe | Select-Object Name, Length
 
       - name: Publish the release
         uses: softprops/action-gh-release@v2
@@ -79,6 +79,6 @@ jobs:
           tag_name: v${{ steps.ver.outputs.version }}-build${{ github.run_number }}
           name: EventCut Engine ${{ steps.ver.outputs.version }}
           body: |
-            Download **EventCut-Engine-Setup.exe** below and run it. Windows may show "Windows protected your PC": click **More info**, then **Run anyway**.
-          files: engine/build/Output/EventCut-Engine-Setup.exe
+            Download **EventCut-Engine-Setup-${{ steps.ver.outputs.version }}.exe** below and run it. Windows may show "Windows protected your PC": click **More info**, then **Run anyway**.
+          files: engine/build/Output/EventCut-Engine-Setup-*.exe
           make_latest: true
