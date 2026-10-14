@@ -14,11 +14,11 @@ import urllib.error
 import urllib.request
 
 from . import media
-from .config import HOME, load_settings
+from .config import HOME, WORK, load_settings
 
 API = os.environ.get("EVENTCUT_FAL_API", "https://queue.fal.run")  # override only for testing
 MODEL = "fal-ai/whisper"
-LOG = HOME / "Projects" / "_ai" / "fal_usage.json"
+LOG = WORK / "_ai" / "fal_usage.json"
 MAX_BYTES = 40 * 1024 * 1024  # longer recordings than ~2.5 hours per clip are heard on this PC instead
 _lock = threading.Lock()
 

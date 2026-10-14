@@ -12,9 +12,9 @@ import cv2
 import numpy as np
 
 from . import media
-from .config import HOME
+from .config import HOME, WORK
 
-CACHE = HOME / "Projects" / "_analysis"
+CACHE = WORK / "_analysis"
 FPS = 10  # proxy frame rate used for analysis
 _tls = threading.local()  # one face detector per worker thread (several clips are analysed at once)
 
@@ -227,7 +227,21 @@ def analyse_photo(path: str) -> dict:
     out_json = CACHE / f"{key}.json"
     if out_json.exists():
         return json.loads(out_json.read_text("utf-8"))
-    img = cv2.imread(path)
+    # big camera JPEGs are decoded at a quarter size (much faster; the analysis works on a small picture anyway)
+    full_w = full_h = None
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            full_w, full_h = im.size
+            try:
+                from PIL import ImageOps
+                if ImageOps.exif_transpose(im).size != im.size:
+                    full_w, full_h = full_h, full_w
+            except Exception:
+                pass
+    except Exception:
+        pass
+    img = cv2.imread(path, cv2.IMREAD_REDUCED_COLOR_4) if (full_w or 0) >= 2400 else cv2.imread(path)
     if img is None:  # HEIC etc: let ffmpeg convert
         tmp = CACHE / f"{key}.jpg"
         ffmpeg, _ = media.tools()
@@ -235,6 +249,8 @@ def analyse_photo(path: str) -> dict:
         img = cv2.imread(str(tmp))
     m, _ = _frame_metrics(img, None, True)
     h, w = img.shape[:2]
+    if full_w and full_h and abs(full_w / full_h - w / h) < 0.05:
+        w, h = full_w, full_h
     score = _quality(m) + 0.6 * min(1.0, m["faces"] / 3)
     psig = signature(img)
     result = {"path": path, "key": key, "kind": "photo", "info": {"width": w, "height": h, "duration": 0}, "captured": None,

@@ -11,10 +11,10 @@ from pathlib import Path
 
 import numpy as np
 
-from .config import HOME
+from .config import HOME, LOOKS, WORK
 
 SIZE = 33
-LUT_DIR = HOME / "Projects" / "_luts"
+LUT_DIR = WORK / "_luts"
 
 
 def grid(size=SIZE):
@@ -403,8 +403,9 @@ def lut_for(**kw) -> Path:
 
 
 def export_preset_luts():
-    """Write the built-in presets into Presets/LUTs so users can reuse them in Premiere/Resolve too."""
-    out = HOME / "Presets" / "LUTs"
+    """Write the built-in presets into the Looks folder so users can reuse them in Premiere/Resolve too."""
+    out = LOOKS
+    out.mkdir(parents=True, exist_ok=True)
     for name in PRESETS:
         p = out / f"EventCut - {name}.cube"
         if not p.exists():

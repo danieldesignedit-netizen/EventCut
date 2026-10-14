@@ -12,10 +12,10 @@ from pathlib import Path
 import numpy as np
 
 from . import media
-from .config import HOME
+from .config import HOME, WORK
 
 RATE = 100  # loudness samples per second
-CACHE = HOME / "Projects" / "_sync"
+CACHE = WORK / "_sync"
 
 
 def _env(path, cache_tag):
@@ -48,7 +48,7 @@ def _key(path):
     return hashlib.sha1(f"{path}|{st.st_size}|{int(st.st_mtime)}".encode()).hexdigest()[:16]
 
 
-def match(videos, recordings, progress=None):
+def match(videos, recordings, progress=None, sources=None):
     """{video_path: {"audio": recording, "offset": seconds into the recording where the clip starts, "score": z}}"""
     if not videos or not recordings:
         return {}
@@ -67,7 +67,7 @@ def match(videos, recordings, progress=None):
     for i, v in enumerate(videos):
         if progress:
             progress(i / max(1, len(videos)))
-        ve = _env(v, _key(v))
+        ve = _env((sources or {}).get(v) or v, _key(v))  # the skim's sound when there is one (no need to read the 4K file again)
         if len(ve) < RATE * 3:
             continue
         ve = (ve - ve.mean()) / (ve.std() + 1e-6)

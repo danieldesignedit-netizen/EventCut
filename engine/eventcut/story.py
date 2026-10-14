@@ -84,7 +84,8 @@ def photo_rules(settings, analyses):
     if not has_video:
         return "normal", 10 ** 6
     body = float(settings.get("duration", 60))
-    cap = 0 if mode == "never" else 10 ** 6 if mode == "normal" else max(1, int(body / 1.6 * 0.1))
+    # very few photos: about one a minute (never more than 2 a minute), and only where the videos run short
+    cap = 0 if mode == "never" else 10 ** 6 if mode == "normal" else max(1, int(round(body / 60 * 1.2)))
     if mode == "rarely":
         # photos fill in only where the videos run short: never cut a video short when photos could finish it
         n_video = sum(1 for a in analyses if a.get("kind") == "video" for m in a.get("moments", []) if not m.get("reject"))
@@ -154,8 +155,11 @@ def mood_from_prompt(prompt: str, template: str, rng=None) -> str:
     return "upbeat"
 
 
-def _moment_pool(analyses, terms, transcripts, taste, rng, randomness, director=None, avoid=None, prof=None):
+def _moment_pool(analyses, terms, transcripts, taste, rng, randomness, director=None, avoid=None, prof=None, ai_picks=None):
     director = director or {}
+    picks_by = {}
+    for p in ai_picks or []:  # Google AI's picks, made from the Direction box
+        picks_by.setdefault(p["path"], []).append(p)
     avoid = avoid or []
     w = (prof or DEFAULT_PROFILE)["w"]
     photo_mode = (prof or {}).get("_photos", "rarely")
@@ -189,6 +193,11 @@ def _moment_pool(analyses, terms, transcripts, taste, rng, randomness, director=
             s += rng.gumbel() * randomness  # regenerate = different picks
             if any(v.get("src") == a["path"] and m["start"] < float(v["end"]) and float(v["start"]) < m["end"] for v in avoid):
                 s -= 0.45  # used in the previous version: prefer something new
+            for p in picks_by.get(a["path"], ()):
+                if m["start"] < p["end"] + 0.5 and p["start"] - 0.5 < m["end"]:
+                    s += 0.25 + 0.06 * (float(p.get("score", 5)) - 5)
+                    hit += 1  # keeps it in the running even when its picture scores are modest
+                    break
             d = director.get(f"{a['path']}|{i}")
             if d:
                 s += d["boost"]
@@ -224,7 +233,7 @@ def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
     terms = prompt_terms(settings.get("prompt", ""))
     pool = _moment_pool(analyses, terms, transcripts, taste, rng, randomness=0.12 if seed else 0.02,
                         director=settings.get("director_picks"), avoid=settings.get("avoid"),
-                        prof=dict(profile_for(settings.get("event_type", "")), _photos=photo_rules(settings, analyses)[0]))
+                        prof=dict(profile_for(settings.get("event_type", "")), _photos=photo_rules(settings, analyses)[0]), ai_picks=settings.get("_ai_picks"))
     if not pool:
         raise ValueError("No usable shots found. The footage may be too dark, blurry or shaky.")
 
@@ -354,7 +363,8 @@ def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
     return {"template": tmpl_name, "bpm": grid["bpm"], "sections": [{"name": b[0], "start": b[1], "end": b[2]} for b in bounds],
             "shots": shots, "body": round(total, 3), "end_card": round(duration - total, 3), "drop_at": round(peak_start, 3),
             "mood": settings.get("music_mood") or music_family(settings),
-            "leaks": pick_leaks(shots, rng, tmpl_name), "warning": warning, "shortened": bool(warning), "order": "highlights"}
+            "leaks": pick_leaks(shots, rng, tmpl_name), "warning": warning, "shortened": bool(warning), "order": "highlights",
+            "spares": spares_from(pool, used)}
 
 
 # Transition families. Names map to an FFmpeg xfade style and duration in render.XFADE.
@@ -479,6 +489,18 @@ def source_order(analyses) -> list:
     return sorted(paths, key=_natural_key)
 
 
+def spares_from(pool, used_keys, n=40):
+    """Back-up moments: if a chosen clip can't be rendered (a damaged part of the file), one of these replaces it."""
+    out = []
+    for c in sorted((c for c in pool if c["kind"] != "photo" and (c["src"], c["idx"]) not in used_keys), key=lambda c: -c["score"]):
+        m = c["m"]
+        out.append({"src": c["src"], "kind": c["kind"], "start": m["start"], "end": m["end"], "face_x": m.get("face_x", 0.5),
+                    "fps": c["fps"], "log": c["log"], "moment": c["idx"], "score": round(c["score"], 3)})
+        if len(out) >= n:
+            break
+    return out
+
+
 def _shot_len(m, beat, pace, calm=False):
     """Seconds for a shot: energetic moments cut fast, faces and calm moments breathe. Always whole half-beats."""
     e = m.get("energy", 0)
@@ -508,7 +530,7 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
     rng = np.random.default_rng(seed)
     pool = _moment_pool(analyses, prompt_terms(settings.get("prompt", "")), transcripts, taste, rng,
                         randomness=0.12 if seed else 0.02, director=settings.get("director_picks"), avoid=settings.get("avoid"),
-                        prof=dict(profile_for(settings.get("event_type", "")), _photos=photo_rules(settings, analyses)[0]))
+                        prof=dict(profile_for(settings.get("event_type", "")), _photos=photo_rules(settings, analyses)[0]), ai_picks=settings.get("_ai_picks"))
     if not pool:
         raise ValueError("No usable shots found. The footage may be too dark, blurry or shaky.")
     beat = 60.0 / grid["bpm"]
@@ -526,6 +548,9 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
 
     chosen, hook = [], []
     _, photo_cap = photo_rules(settings, analyses)
+    vid_scores = [c["score"] for c in good if c["kind"] != "photo"]
+    plenty = len(vid_scores) >= max(12, int(body / 1.6) + 1)  # enough video moments to fill the video
+    strong_photo = float(np.percentile(vid_scores, 70)) if plenty else -1e9
 
     def too_similar(c, picked, limit):
         sig = c["m"].get("sig")
@@ -561,8 +586,9 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
         L = _shot_len(m, beat, pace)
         if L <= 0:
             continue
-        if c["kind"] == "photo" and sum(1 for o in chosen if o["kind"] == "photo") >= photo_cap:
-            continue
+        if c["kind"] == "photo" and (sum(1 for o in chosen if o["kind"] == "photo") >= photo_cap or
+                                     (photo_cap < 10 ** 6 and c["score"] < strong_photo)):
+            continue  # a photo only goes in when it is clearly one of the strongest pictures of the event
         key = (c["src"], m.get("scene", 0))
         cap = 1 + int(m.get("scene_len", 0) // 7)  # long takes may give a few moments, short scenes one
         if per_scene.get(key, 0) >= cap:
@@ -575,6 +601,20 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
         chosen.append(c)
         per_scene[key] = per_scene.get(key, 0) + 1
         picked_len += L
+    # videos ran out before the video was full: photos fill the gap (only then, and only the best ones)
+    if picked_len < remaining - beat and photo_cap < 10 ** 6 and settings.get("photos", "rarely") != "never":
+        used_keys = {(o["src"], o["idx"]) for o in chosen} | hook_keys
+        for c in sorted((c for c in good if c["kind"] == "photo" and (c["src"], c["idx"]) not in used_keys), key=lambda c: -c["score"]):
+            if picked_len >= remaining - beat * 0.5:
+                break
+            if too_similar(c, [o for o in chosen if o["kind"] == "photo"], prof.get("variety", 0.93)):
+                continue
+            L = _shot_len(c["m"], beat, pace)
+            if L <= 0:
+                continue
+            c["len"] = L
+            chosen.append(c)
+            picked_len += L
     # too long: drop the weakest picks (keeping each clip represented if possible)
     while picked_len > remaining + beat * 0.5 and len(chosen) > 1:
         counts = {}
@@ -628,7 +668,8 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
             "shots": shots, "body": round(total, 3), "end_card": round(end_card if shortened else max(end_card, duration - total), 3),
             "drop_at": round(hook_len, 3) if hook_len else round(min(total * 0.3, 8 * beat * 4), 3),
             "mood": settings.get("music_mood") or music_family(settings),
-            "leaks": leaks, "warning": warning, "shortened": shortened}
+            "leaks": leaks, "warning": warning, "shortened": shortened,
+            "spares": spares_from(pool, {(s["src"], s.get("moment")) for s in shots})}
 
 
 def assign_transitions_chrono(shots, tmpl_name, rng, amount="normal", fam=None):

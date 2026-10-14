@@ -18,11 +18,11 @@ from pathlib import Path
 import numpy as np
 
 from . import analyze, media
-from .config import HOME
+from .config import HOME, WORK
 
 GAP = 3 * 3600
 TILE_W, TILE_H = 256, 144
-CACHE = HOME / "Projects" / "_sort"
+CACHE = WORK / "_sort"
 
 
 # ------------------------------------------------------------------ when was it recorded

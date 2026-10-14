@@ -53,7 +53,25 @@ def tray(url):
     return True
 
 
+def start_log():
+    """The tray app has no console: keep everything the engine prints in EventCut/Logs/engine.log (for support)."""
+    try:
+        logs = config.HOME / "Logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        f = logs / "engine.log"
+        if f.exists() and f.stat().st_size > 5 * 1024 * 1024:
+            os.replace(f, logs / "engine.old.log")
+        out = open(f, "a", encoding="utf-8", buffering=1)
+        out.write(f"\n===== EventCut Engine {config.VERSION} started {__import__('time').strftime('%Y-%m-%d %H:%M:%S')}\n")
+        sys.stdout = sys.stderr = out
+        import faulthandler
+        faulthandler.enable(out)  # even a hard crash leaves a trace
+    except Exception:
+        pass
+
+
 def main():
+    start_log()
     url = site_url()
     ensure_origin(url)
     t = threading.Thread(target=server.serve, daemon=True)

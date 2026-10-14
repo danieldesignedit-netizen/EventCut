@@ -1,7 +1,7 @@
 """Beat detection, plus EventCut's own procedurally generated music beds and sound effects.
 
 All generated audio is original (synthesised here), so it is free for commercial use.
-Users can also drop licensed tracks into "Music & SFX/Music" or upload their own.
+Users can also drop licensed tracks into the EventCut "Music" folder or upload their own.
 """
 import json
 import wave
@@ -10,17 +10,31 @@ from pathlib import Path
 import numpy as np
 from scipy import signal
 
-from .config import HOME
+from .config import (EPIDEMIC, EPIDEMIC_MUSIC, EPIDEMIC_SFX, HOME, MUSIC, MUSIC_LIBRARY, MUSIC_UPLOADS, SFX,
+                     SFX_LIBRARY, SFX_ORIGINALS, WORK)
 from . import media
 
 SR = 44100
-LIB = HOME / "Music & SFX"
+LIB = HOME  # see the folder constants in config
 
 
 # ---------------------------------------------------------------- beat detection
+def shift_grid(grid: dict, start: float) -> dict:
+    """Beat grid for music that starts `start` seconds into the track (e.g. at its most popular section)."""
+    if not start:
+        return grid
+    g = dict(grid)
+    g["beats"] = [round(b - start, 3) for b in grid.get("beats", []) if b >= start]
+    g["downbeats"] = [round(b - start, 3) for b in grid.get("downbeats", []) if b >= start]
+    rate = grid.get("energy_rate", 4)
+    g["energy"] = grid.get("energy", [])[int(start * rate):]
+    g["duration"] = round(max(0.0, grid.get("duration", 0) - start), 2)
+    return g
+
+
 def detect_beats(path: str) -> dict:
     """Tempo, beat times, downbeats and an energy curve (for finding the drop)."""
-    cache = Path(str(path) + ".beats.json") if str(path).startswith(str(LIB)) else None
+    cache = Path(str(path) + ".beats.json") if any(str(path).startswith(str(d)) for d in (MUSIC, EPIDEMIC, SFX)) else None
     if cache and cache.exists():
         return json.loads(cache.read_text())
     sr = 22050
@@ -434,14 +448,15 @@ def _sfx_set():
 
 def ensure_library() -> dict:
     """Write the original SFX set and the chime once; music is generated per video to fit its length."""
-    sfx_dir = LIB / "SFX"
+    sfx_dir = SFX_ORIGINALS
     sfx_dir.mkdir(parents=True, exist_ok=True)
     for name, fn in _sfx_set().items():
         p = sfx_dir / f"EventCut {name}.wav"
         if not p.exists():
             write_wav(p, fn())
     for ok in (True, False):
-        p = LIB / ("eventcut_done.wav" if ok else "eventcut_failed.wav")
+        p = WORK / "Sounds" / ("eventcut_done.wav" if ok else "eventcut_failed.wav")
+        p.parent.mkdir(parents=True, exist_ok=True)
         if not p.exists():
             write_wav(p, signature_chime(ok))
     return library_listing()
@@ -458,7 +473,7 @@ SFX_FAMILY_WORDS = {
 def sfx_families() -> dict:
     """All available effects (originals + downloaded library effects) grouped by family."""
     files = []
-    for d in (LIB / "SFX", LIB / "Library" / "SFX"):
+    for d in (SFX_ORIGINALS, SFX_LIBRARY):
         if d.exists():
             files += [f for f in d.iterdir() if f.suffix.lower() in media.AUDIO_EXT]
     fams = {k: [] for k in SFX_FAMILY_WORDS}
@@ -566,10 +581,10 @@ def search_online(q: str = "", category: str = "music", page: int = 1, page_size
 
 
 def download_online(item: dict, category: str = "music") -> str:
-    """Save a library track into Music & SFX/Library with its licence and attribution next to it."""
+    """Save a free library track into Music/Free library (or Sound effects/Free library) with its licence and attribution next to it."""
     import re
     import urllib.request
-    folder = LIB / "Library" / ("Music" if category == "music" else "SFX")
+    folder = MUSIC_LIBRARY if category == "music" else SFX_LIBRARY
     folder.mkdir(parents=True, exist_ok=True)
     base = re.sub(r"[^A-Za-z0-9 ._()-]+", "", f"{item.get('title', 'Track')} - {item.get('creator', '')}").strip()[:90] or "Track"
     ext = "." + (item.get("filetype") or "mp3").lower().strip(".")
@@ -591,7 +606,7 @@ def download_online(item: dict, category: str = "music") -> str:
     return str(dest)
 
 
-HISTORY = LIB / "music_history.json"
+HISTORY = WORK / "music_history.json"
 
 
 def _history():
@@ -607,11 +622,32 @@ def _remember(key):
     HISTORY.write_text(json.dumps(h), "utf-8")
 
 
-def pick_auto_music(family: str, duration: float, seed: int, online: bool = True):
-    """A different song every new video and every regenerate: a library track for the mood (online), otherwise an
-    EventCut original. The last couple of dozen picks are remembered and never repeated."""
+def pick_auto_music(family: str, duration: float, seed: int, online: bool = True, prompt: str = "", brief: dict = None):
+    """A different song every new video and every regenerate: Epidemic Sound (if the company key is set), else a
+    free library track for the mood (online), else an EventCut original. Recent picks are never repeated."""
     rng = np.random.default_rng(seed * 104729 + 7)
     recent = set(_history())
+    epi_err = None
+    from . import epidemic
+    if epidemic.enabled() and epidemic.cfg()["auto"]:
+        if not online:
+            epi_err = "online music is switched off for this video"
+        else:
+            try:
+                m = epidemic.auto_pick(family, duration, rng, recent, prompt, brief)
+                _remember(f"es:{m['es_id']}")
+                return m
+            except Exception as e:
+                epi_err = str(e).splitlines()[0][:200]
+                print("Epidemic Sound not used:", e)
+    fallback = _pick_builtin(family, duration, rng, recent, online)
+    if epi_err:
+        fallback["epidemic_error"] = epi_err
+    return fallback
+
+
+def _pick_builtin(family, duration, rng, recent, online):
+    """The built-in music library: a free online library track for the mood, else an EventCut original."""
     if online:
         try:
             queries = list(FAMILY_QUERIES.get(family, FAMILY_QUERIES["upbeat"]))
@@ -638,14 +674,15 @@ def pick_auto_music(family: str, duration: float, seed: int, online: bool = True
 def library_listing() -> dict:
     music = [{"name": m, "source": "EventCut original, made to fit each video", "licence": "Free for commercial use", "generated": True,
               "bpm": cfg["bpm"], "family": cfg["family"]} for m, cfg in MOODS.items()]
-    for folder, tag in [(LIB / "Library" / "Music", "Library"), (LIB / "Music", "Library"), (LIB / "Uploads", "Your upload")]:
+    for folder, tag in [(EPIDEMIC_MUSIC, "Epidemic Sound"), (MUSIC_LIBRARY, "Free library"), (MUSIC, "Your music"),
+                        (MUSIC_UPLOADS, "Your upload")]:
         for f in sorted(folder.glob("*")) if folder.exists() else []:
             if f.suffix.lower() in media.AUDIO_EXT | {".ogg", ".opus"}:
                 lic = f.with_suffix(".licence.txt")
                 music.append({"name": f.stem, "path": str(f), "source": tag,
                               "licence": lic.read_text("utf-8").splitlines()[0] if lic.exists() else ("You confirmed you hold the rights" if tag == "Your upload" else "See library notes")})
     sfx = []
-    for folder, tag in [(LIB / "SFX", "EventCut original"), (LIB / "Library" / "SFX", "Library")]:
+    for folder, tag in [(EPIDEMIC_SFX, "Epidemic Sound"), (SFX_ORIGINALS, "EventCut original"), (SFX_LIBRARY, "Free library")]:
         for f in sorted(folder.glob("*")) if folder.exists() else []:
             if f.suffix.lower() in media.AUDIO_EXT | {".ogg", ".opus"}:
                 sfx.append({"name": f.stem, "path": str(f), "source": tag})

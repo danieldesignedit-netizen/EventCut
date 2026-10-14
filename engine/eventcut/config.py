@@ -6,7 +6,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "1.5.5"
+VERSION = "1.6.0"
 PORT = int(os.environ.get("EVENTCUT_PORT", "7788"))
 
 # Origins allowed to drive this engine. The installer writes the real Netlify URL
@@ -28,14 +28,106 @@ def home_folder() -> Path:
 
 
 HOME = home_folder()
-SUBFOLDERS = ["Assets", "Presets", "Music & SFX", "Projects", "Exports", "Styles"]
+SETTINGS_FILE = HOME / "settings.json"
+
+# One EventCut folder, with plain-language subfolders people can find their way around.
+FINISHED = HOME / "Finished videos"        # every project and its versions
+LOGOS = HOME / "Logos"
+FONTS = HOME / "Fonts"
+MUSIC = HOME / "Music"                      # drop your own licensed tracks straight in here
+MUSIC_UPLOADS = MUSIC / "Your uploads"
+MUSIC_LIBRARY = MUSIC / "Free library"
+SFX = HOME / "Sound effects"
+SFX_ORIGINALS = SFX / "EventCut originals"
+SFX_LIBRARY = SFX / "Free library"
+EPIDEMIC = HOME / "Epidemic Sound"
+EPIDEMIC_MUSIC = EPIDEMIC / "Music"
+EPIDEMIC_SFX = EPIDEMIC / "Sound effects"
+LOOKS = HOME / "Looks"                      # LUTs (.cube) go straight in here
+STYLES = LOOKS / "Styles"
+LOGS = HOME / "Logs"
+WORK = HOME / "Working files"               # EventCut's own caches: safe to ignore (or delete to free space)
+
+FOLDERS = [FINISHED, LOGOS, FONTS, MUSIC, MUSIC_UPLOADS, MUSIC_LIBRARY, SFX, SFX_ORIGINALS, SFX_LIBRARY,
+           EPIDEMIC, EPIDEMIC_MUSIC, EPIDEMIC_SFX, LOOKS, STYLES, LOGS, WORK]
+
+# where things lived before version 1.6 (moved automatically, once)
+OLD_LAYOUT = [
+    ("Exports", FINISHED), ("Assets/Logos", LOGOS), ("Assets/Fonts", FONTS), ("Assets", WORK / "Brand kit"),
+    ("Presets/LUTs", LOOKS), ("Presets", LOOKS), ("Styles", STYLES),
+    ("Music & SFX/Epidemic Sound", EPIDEMIC_MUSIC), ("Music & SFX/Uploads", MUSIC_UPLOADS),
+    ("Music & SFX/Library/Music", MUSIC_LIBRARY), ("Music & SFX/Library/SFX", SFX_LIBRARY), ("Music & SFX/Library", MUSIC_LIBRARY),
+    ("Music & SFX/Music", MUSIC), ("Music & SFX/SFX", SFX_ORIGINALS), ("Music & SFX/_previews", WORK / "_previews_audio"),
+    ("Music & SFX", WORK), ("Projects", WORK),
+]
+_migrated = [False]
+
+
+def _merge_move(src: Path, dst: Path):
+    """Move everything in src into dst (never overwriting), then remove src if it ended up empty."""
+    dst.mkdir(parents=True, exist_ok=True)
+    for item in list(src.iterdir()):
+        target = dst / item.name
+        try:
+            if target.exists():
+                if item.is_dir() and target.is_dir():
+                    _merge_move(item, target)
+                continue  # keep what is already in the new place
+            shutil.move(str(item), str(target))
+        except Exception:
+            pass
+    try:
+        src.rmdir()
+    except OSError:
+        pass
+
+
+def _rewrite_paths(file: Path, pairs):
+    try:
+        txt = file.read_text("utf-8")
+        new = txt
+        for a, b in pairs:
+            new = new.replace(a, b)
+        if new != txt:
+            file.write_text(new, "utf-8")
+    except Exception:
+        pass
+
+
+def migrate_layout() -> None:
+    """Move an older EventCut folder (Assets, Presets, Music & SFX, Projects, Exports) into the new layout.
+    Saved projects and the analysis cache are updated to point at the new places."""
+    if _migrated[0]:
+        return
+    _migrated[0] = True
+    moved = []
+    for old, new in OLD_LAYOUT:
+        src = HOME / old
+        if src.is_dir():
+            moved.append((src, new))
+            _merge_move(src, new)
+    if not moved:
+        return
+    pairs = []
+    for src, new in moved:
+        for a, b in ((str(src), str(new)), (str(src).replace("\\", "\\\\"), str(new).replace("\\", "\\\\")),
+                     (str(src).replace("\\", "/"), str(new).replace("\\", "/"))):
+            if a != b and (a, b) not in pairs:
+                pairs.append((a, b))
+    pairs.sort(key=lambda ab: -len(ab[0]))  # most specific first (Music & SFX/Epidemic Sound before Music & SFX)
+    for pj in FINISHED.glob("*/Version */project.json"):
+        _rewrite_paths(pj, pairs)
+    an = WORK / "_analysis"
+    if an.is_dir():
+        for f in an.glob("*.json"):
+            _rewrite_paths(f, pairs)
+    _rewrite_paths(SETTINGS_FILE, pairs)
 
 
 def ensure_folders() -> None:
-    for name in SUBFOLDERS:
-        (HOME / name).mkdir(parents=True, exist_ok=True)
-    for sub in ["Assets/Logos", "Assets/Fonts", "Presets/LUTs", "Music & SFX/Music", "Music & SFX/SFX", "Music & SFX/Uploads"]:
-        (HOME / sub).mkdir(parents=True, exist_ok=True)
+    migrate_layout()
+    for d in FOLDERS:
+        d.mkdir(parents=True, exist_ok=True)
 
 
 def bin_path(name: str) -> str:
@@ -62,7 +154,6 @@ def tools():
     return FFMPEG, FFPROBE
 
 
-SETTINGS_FILE = HOME / "settings.json"
 DEFAULT_SETTINGS = {
     "allowed_origins": DEFAULT_ORIGINS,
     "supabase_url": "",

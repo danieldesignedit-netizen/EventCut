@@ -17,17 +17,20 @@ import time
 import traceback
 import urllib.request
 import uuid
+
+import numpy as np
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import falai, analyze, audio, gemini, grade, media, render, smart, story
-from .config import HOME, PORT, VERSION, ensure_folders, load_settings, save_settings
+from . import epidemic, falai, analyze, audio, gemini, grade, media, render, smart, story
+from .config import (FINISHED, FONTS, HOME, LOGOS, LOGS, LOOKS, MUSIC_UPLOADS, PORT, VERSION, WORK, ensure_folders,
+                     load_settings, save_settings)
 
 JOBS = {}
 ALLOWED_ROOTS = set()
 _auth_cache = {}  # token hash -> (expires, user)
-SPEED_FILE = HOME / "Projects" / "speed.json"
+SPEED_FILE = WORK / "speed.json"
 
 
 # ------------------------------------------------------------------ access control
@@ -63,7 +66,7 @@ def verify_access(token):
             rows = json.loads(r.read())
     except Exception:
         # offline: honour a recent approval for up to 3 days
-        offline = HOME / "Projects" / "_access.json"
+        offline = WORK / "_access.json"
         if offline.exists():
             d = json.loads(offline.read_text())
             if d.get("sub") == claims.get("sub") and d.get("until", 0) > time.time():
@@ -76,7 +79,7 @@ def verify_access(token):
                                "revoked": "Your access has been removed by the admin."}.get(status, "You don't have access yet."))
     user = rows[0]
     _auth_cache[h] = (time.time() + 600, user)  # re-check every 10 minutes so revoking takes effect quickly
-    (HOME / "Projects" / "_access.json").write_text(json.dumps({"sub": claims.get("sub"), "user": user, "until": time.time() + 3 * 86400}))
+    (WORK / "_access.json").write_text(json.dumps({"sub": claims.get("sub"), "user": user, "until": time.time() + 3 * 86400}))
     return user
 
 
@@ -131,6 +134,7 @@ class Job:
         self.done_w = 0.0
         self.stage_key = None
         self.stage_t0 = time.time()
+        self.notices = []
 
     def plan_stages(self, weights):
         """weights: ordered {stage: expected_seconds}."""
@@ -170,14 +174,15 @@ class Job:
 
     def snapshot(self):
         return {"id": self.id, "kind": self.kind, "title": self.title, "clips": self.clips, "state": self.state, "stage": self.stage, "stage_key": self.stage_key, "note": self.note,
-                "progress": round(self.progress, 4), "eta": self.eta, "error": self.error, "result": self.result}
+                "progress": round(self.progress, 4), "eta": self.eta, "error": self.error, "result": self.result,
+                "notices": list(self.notices)}
 
 
 def play_sound(ok=True):
     cfg = load_settings()
     if not cfg.get("notify_sound", True):
         return
-    f = audio.LIB / ("eventcut_done.wav" if ok else "eventcut_failed.wav")
+    f = WORK / "Sounds" / ("eventcut_done.wav" if ok else "eventcut_failed.wav")
     if platform.system() == "Windows" and f.exists():
         try:
             import winsound
@@ -188,7 +193,7 @@ def play_sound(ok=True):
 
 def project_dir(name):
     safe = re.sub(r"[^A-Za-z0-9 _-]+", "", name or "Event").strip() or "Event"
-    base = HOME / "Exports" / safe
+    base = FINISHED / safe
     base.mkdir(parents=True, exist_ok=True)
     n = 1 + max([int(p.name.split(" ")[-1]) for p in base.glob("Version *") if p.name.split(" ")[-1].isdigit()] or [0])
     d = base / f"Version {n}"
@@ -203,7 +208,7 @@ def feed_copy(src):
     if not src or not path_allowed(src) or not os.path.isfile(src):
         raise ValueError("Video not found")
     ff, _ = media.tools()
-    folder = HOME / "Projects" / "_feed"
+    folder = WORK / "_feed"
     folder.mkdir(parents=True, exist_ok=True)
     key = hashlib.sha1(f"{src}|{os.path.getmtime(src)}|hd2".encode()).hexdigest()[:16]
     vid, img = folder / f"{key}.mp4", folder / f"{key}.jpg"
@@ -239,7 +244,7 @@ def grade_frame(p, t, preset, intensity=1.0, log_profile=None, width=960, wide=F
                         correction=grade.correction_params(a.get("frames", [])) if a.get("frames") else None,
                         preset_name=preset, intensity=float(intensity), transfer=None, theme_hex=None)
     tag = json.dumps([p, round(t, 2), preset, round(float(intensity), 2), log_profile, width, wide])
-    out = HOME / "Projects" / "_thumbs" / f"grade_{hashlib.sha1(tag.encode()).hexdigest()[:12]}.jpg"
+    out = WORK / "_thumbs" / f"grade_{hashlib.sha1(tag.encode()).hexdigest()[:12]}.jpg"
     out.parent.mkdir(parents=True, exist_ok=True)
     if not out.exists():
         media.run([ff, "-y", "-v", "error", "-ss", f"{t:.2f}", "-i", p, "-vf",
@@ -250,7 +255,7 @@ def grade_frame(p, t, preset, intensity=1.0, log_profile=None, width=960, wide=F
 def raw_frame(p, t, width=960, wide=False):
     """The frame exactly as the camera recorded it (for 'straight from camera')."""
     ff, _ = media.tools()
-    out = HOME / "Projects" / "_thumbs" / f"raw_{hashlib.sha1(json.dumps([p, round(t, 2), width, wide]).encode()).hexdigest()[:12]}.jpg"
+    out = WORK / "_thumbs" / f"raw_{hashlib.sha1(json.dumps([p, round(t, 2), width, wide]).encode()).hexdigest()[:12]}.jpg"
     out.parent.mkdir(parents=True, exist_ok=True)
     if not out.exists():
         media.run([ff, "-y", "-v", "error", "-ss", f"{t:.2f}", "-i", p, "-vf", WIDE_CROP if wide else f"scale={width}:-2",
@@ -258,7 +263,7 @@ def raw_frame(p, t, width=960, wide=False):
     return out
 
 
-def ai_colour_pass(analyses, s, job=None):
+def ai_colour_pass(analyses, s, job=None, notices=None):
     """Ask the Google AI colourist about one representative, corrected frame per clip (in parallel)."""
     from concurrent.futures import ThreadPoolExecutor
     ff, _ = media.tools()
@@ -277,7 +282,7 @@ def ai_colour_pass(analyses, s, job=None):
         log = a.get("log") or {}
         lut = grade.lut_for(log_profile=log.get("profile") if log.get("is_log") else None,
                             correction=grade.correction_params(a.get("frames", [])), preset_name="Natural", intensity=0.0)
-        jpg = HOME / "Projects" / "_thumbs" / f"aicol_{a['key']}_{round(t, 1)}.jpg"
+        jpg = WORK / "_thumbs" / f"aicol_{a['key']}_{round(t, 1)}.jpg"
         jpg.parent.mkdir(parents=True, exist_ok=True)
         if not jpg.exists():
             media.run([ff, "-y", "-v", "error", "-ss", f"{t:.2f}", "-i", a["path"], "-vf", f"scale=768:-2,lut3d=file='{render.fpath(lut)}'",
@@ -290,7 +295,10 @@ def ai_colour_pass(analyses, s, job=None):
                 p, params = fut.result()
                 out[p] = params
             except gemini.AIError as e:
-                if "reach Google" in str(e) or "spending cap" in str(e) or "rejected" in str(e):
+                if "reach Google" in str(e) or "spending cap" in str(e) or "rejected" in str(e) or "usage limit" in str(e):
+                    if not offline["yes"] and notices is not None and str(e) != "skipped":
+                        notices.append(f"The Google AI colourist wasn't used: {gemini.why_not(e)}. "
+                                       "Clips got EventCut's standard colour correction instead.")
                     offline["yes"] = True
                 # this clip keeps the standard correction
             except Exception:
@@ -351,58 +359,170 @@ def run_generate(job: Job):
         dur = float(s.get("duration", 60))
         talk = story.template_for(s.get("event_type", "")) == "talk"
         use_ai = talk and gemini.enabled() and s.get("google_ai", True)
-        # speech: needed for captions; for podcasts without Google AI it also gives exact sentence edges
-        want_words = (s.get("captions") or (talk and not use_ai) or (s.get("prompt") and not use_ai)) and smart.speech_available()
-        job.plan_stages({"analyse": 1 if cached else foot * sp["analyse"],
+        # Fast watching (always on): skim every clip from its keyframes, then study only the best stretches closely.
+        # Podcasts and interviews (a few long recordings where every word matters) and small projects are studied in full.
+        skim = not talk and foot > float(load_settings().get("skim_min_minutes", 15)) * 60
+        notices = job.notices
+        s["_notices"] = notices
+        want_words = (s.get("captions") or (talk and not use_ai) or (s.get("prompt") and not use_ai and not skim)) and smart.speech_available()
+        pick_ai = skim and s.get("google_ai", True)
+        job.plan_stages({"skim": foot * sp.get("skim", 0.12) if skim else 0,
+                         "picks": foot * 0.004 + 60 if pick_ai else 0,
+                         "analyse": 1 if cached else (dur * 2.2 * 6 * sp["analyse"] if skim else foot * sp["analyse"]),
                          "sync": foot * 0.01 + 5 if any(m["kind"] == "audio" for m in items) else 0,
-                         "transcribe": foot * sp["transcribe_fal" if falai.enabled() else "transcribe"] if want_words else 0,
+                         "transcribe": (dur * 40 if skim else foot) * sp["transcribe_fal" if falai.enabled() else "transcribe"] if want_words else 0,
                          "ai": foot * 0.05 + 40 if use_ai else 0,
                          "colour": 3 * min(len(vids), 40) if (bool(gemini.cfg()["key"]) and load_settings().get("google_colour", True) and s.get("preset") != "None") else 0,
                          "director": 25 if s.get("director") else 0, "plan": 2,
                          **{f"render_{f}": dur * sp["render"] for f in formats},
                          **{f"finish_{f}": dur * sp["finish"] for f in formats}})
-        # 1. analyse
-        job.set_stage("analyse", "Watching every clip")
-        t0 = time.time()
-        analyses = [None] * len(vids)
         workers = analyse_workers()
-        fr = [0.0] * len(vids)
         plock = threading.Lock()
 
-        def one(i):
-            m = vids[i]
-            if job.cancelled:
-                raise InterruptedError
+        def run_parallel(fn, n, nworkers):
+            if nworkers > 1 and n > 1:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(nworkers) as ex:
+                    for _ in ex.map(fn, range(n)):
+                        pass
+            else:
+                for i in range(n):
+                    fn(i)
 
-            def prog(f, i=i):
-                if job.cancelled:
-                    raise InterruptedError
-                with plock:
-                    fr[i] = f
-                    done = sum(1 for x in fr if x >= 1)
-                    job.update(sum(fr) / len(vids), f"Clip {min(len(vids), done + 1)} of {len(vids)}" + (f", {workers} at a time" if workers > 1 else ""))
+        def checked(fn, path):
+            """Run one clip's work; a damaged file is skipped and named at the end, never stops the video."""
             try:
-                analyses[i] = analyze.analyse(m["path"], m["kind"], prog)
+                return fn()
             except InterruptedError:
                 raise
-            except Exception as e:  # a file damaged part-way through: skip it, keep going
-                print("skipped", m["path"], e)
+            except Exception as e:
+                print("skipped", path, e)
                 with plock:
-                    bad.append((m["path"], "damaged or unreadable"))
-            prog(1.0)
-        if workers > 1:
-            from concurrent.futures import ThreadPoolExecutor
-            with ThreadPoolExecutor(workers) as ex:
-                for _ in ex.map(one, range(len(vids))):
-                    pass
+                    if path not in [b[0] for b in bad]:
+                        bad.append((path, "damaged or unreadable"))
+                return None
+        t0 = time.time()
+        if not skim:
+            # 1. analyse every frame (small projects, podcasts)
+            job.set_stage("analyse", "Watching every clip")
+            analyses = [None] * len(vids)
+            fr = [0.0] * len(vids)
+
+            def one(i):
+                m = vids[i]
+                if job.cancelled:
+                    raise InterruptedError
+
+                def prog(f, i=i):
+                    if job.cancelled:
+                        raise InterruptedError
+                    with plock:
+                        fr[i] = f
+                        done = sum(1 for x in fr if x >= 1)
+                        job.update(sum(fr) / len(vids), f"Clip {min(len(vids), done + 1)} of {len(vids)}" + (f", {workers} at a time" if workers > 1 else ""))
+                analyses[i] = checked(lambda: analyze.analyse(m["path"], m["kind"], prog), m["path"])
+                prog(1.0)
+            run_parallel(one, len(vids), workers)
+            analyses = [a for a in analyses if a]
+            if analyses and not cached:
+                update_speed("analyse", (time.time() - t0) / foot)
         else:
-            for i in range(len(vids)):
-                one(i)
-        analyses = [a for a in analyses if a]
+            from . import quick
+            # 1. skim every clip (keyframes only, about 2 pictures a second); clips studied fully in an earlier run are reused
+            job.set_stage("skim", "Skimming every clip")
+            full = {}
+            quicks = [None] * len(vids)
+            photos = [None] * len(vids)
+            fr = [0.0] * len(vids)
+            sworkers = max(workers, min(6, (os.cpu_count() or 4) // 2))
+
+            def skim_one(i):
+                m = vids[i]
+                if job.cancelled:
+                    raise InterruptedError
+
+                def prog(f, i=i):
+                    if job.cancelled:
+                        raise InterruptedError
+                    with plock:
+                        fr[i] = f
+                        done = sum(1 for x in fr if x >= 1)
+                        job.update(sum(fr) / len(vids), f"Clip {min(len(vids), done + 1)} of {len(vids)}, {sworkers} at a time")
+                if m["kind"] == "photo":
+                    photos[i] = checked(lambda: analyze.analyse_photo(m["path"]), m["path"])
+                else:
+                    prev = quick.full_cached(m["path"])
+                    if prev:
+                        with plock:
+                            full[m["path"]] = prev
+                    quicks[i] = checked(lambda: quick.quick_analyse(m["path"], prog), m["path"])
+                prog(1.0)
+            run_parallel(skim_one, len(vids), sworkers)
+            quicks = [q for q in quicks if q]
+            photos = [a for a in photos if a]
+            if quicks:
+                update_speed("skim", (time.time() - t0) / foot)
+            order = story.source_order(quicks)
+            # 2. Google AI watches a small preview of the whole event and picks moments, following the Direction box
+            picks, music_brief = [], {}
+            if pick_ai:
+                job.set_stage("picks", "Google AI is choosing the best moments")
+                if not gemini.enabled() and not gemini.cfg()["key"]:
+                    notices.append("Google AI didn't choose the moments: " + gemini.why_not("No Google AI key") + ". EventCut chose them itself.")
+                elif not gemini.enabled():
+                    notices.append("Google AI didn't choose the moments: " + gemini.why_not("switched off") + ". EventCut chose them itself.")
+                else:
+                    by_path = {q["path"]: q for q in quicks}
+                    clips = [(p, by_path[p]["qproxy"], float(by_path[p]["info"].get("duration") or 0)) for p in order if p in by_path]
+
+                    def gprog(f, note=""):
+                        if job.cancelled:
+                            raise InterruptedError
+                        job.update(f, note)
+                    try:
+                        r = gemini.pick_moments(clips, s.get("event_type", ""), s.get("prompt", ""), dur, gprog)
+                        picks, music_brief = r["picks"], r
+                        s["_ai_picks"] = picks
+                        if r.get("partial"):
+                            notices.append(f"Google AI watched only part of the footage ({r.get('partial_reason')}). "
+                                           "EventCut chose moments for the rest itself.")
+                    except InterruptedError:
+                        raise
+                    except gemini.AIError as e:
+                        notices.append(f"Google AI didn't choose the moments: {gemini.why_not(e)}. EventCut chose them itself.")
+                    except Exception as e:
+                        traceback.print_exc()
+                        notices.append(f"Google AI didn't choose the moments: {str(e).splitlines()[0][:160]}. EventCut chose them itself.")
+            s["_music_brief"] = music_brief
+            # 3. close look at the chosen stretches only
+            job.set_stage("analyse", "Looking closely at the best moments")
+            t1 = time.time()
+            wins = quick.plan_windows([q for q in quicks if q["path"] not in full], dur, picks, order)
+            todo = [q for q in quicks if q["path"] in wins]
+            closes = [None] * len(todo)
+            cf_ = [0.0] * len(todo)
+
+            def close_one(i):
+                q = todo[i]
+                if job.cancelled:
+                    raise InterruptedError
+
+                def prog(f, i=i):
+                    if job.cancelled:
+                        raise InterruptedError
+                    with plock:
+                        cf_[i] = f
+                        job.update(sum(cf_) / max(1, len(todo)), f"{sum(1 for x in cf_ if x >= 1)} of {len(todo)} clips, best moments only")
+                closes[i] = checked(lambda: quick.close_analysis(q, wins[q["path"]], prog), q["path"])
+                prog(1.0)
+            run_parallel(close_one, len(todo), workers)
+            analyses = list(full.values()) + [a for a in closes if a] + photos
+            secs = sum(e - s0 for w in wins.values() for s0, e in w)
+            if secs > 0:
+                update_speed("analyse", (time.time() - t1) / secs)
+            s["_skim"] = {q["path"]: q["qproxy"] for q in quicks}
         if not analyses:
             raise ValueError("None of the videos or photos could be read. Check the files are still in their folder.")
-        if not cached:
-            update_speed("analyse", (time.time() - t0) / foot)
         # 1b. separately recorded sound (recorders, lapel mics, mixing desk) lined up with the camera clips
         recs = [m["path"] for m in items if m["kind"] == "audio"]
         if recs:
@@ -410,54 +530,69 @@ def run_generate(job: Job):
             from . import sync
             try:
                 s["audio_sync"] = sync.match([a["path"] for a in analyses if a["kind"] == "video" and a["info"].get("has_audio")],
-                                             recs, lambda f: job.update(f, "Lining up the sound"))
+                                             recs, lambda f: job.update(f, "Lining up the sound"), sources=s.get("_skim"))
             except Exception as e:  # never stops the edit
                 s["audio_sync"] = {}
                 print("audio sync failed:", e)
-        # 2. transcribe
+        # 2. transcribe (with fast watching this happens after planning, only for the clips in the video)
         transcripts = {}
-        if want_words:
-            job.set_stage("transcribe", "Listening to speeches")
-            t0 = time.time()
-            speak = [a for a in analyses if a["kind"] == "video" and a["info"].get("has_audio")]
-            lens = [float(a["info"].get("duration") or 1) for a in speak]
-            on_fal = falai.enabled()
-            heard = [0.0] * len(speak)
-            hlock = threading.Lock()
+        unheard = []
 
-            def listen(i):
-                a = speak[i]
+        def listen_to(pool, footage_s):
+            if True:
+                job.set_stage("transcribe", "Listening to speeches")
+                t0 = time.time()
+                speak = [a for a in pool if a["kind"] == "video" and a["info"].get("has_audio")]
+                lens = [float(a["info"].get("duration") or 1) for a in speak]
+                on_fal = falai.enabled()
+                heard = [0.0] * len(speak)
+                hlock = threading.Lock()
 
-                def prog(f, note, i=i):
+                def listen(i):
+                    a = speak[i]
+
+                    def prog(f, note, i=i):
+                        if job.cancelled:
+                            raise InterruptedError
+                        if job.skip_stage:
+                            raise smart.Skipped
+                        with hlock:
+                            heard[i] = f
+                            done = sum(1 for x in heard if x >= 1)
+                            msg = f"{done} of {len(speak)} clips heard, on fal" if on_fal else f"Clip {i + 1} of {len(speak)}: {note}"
+                            job.update(sum(h * l for h, l in zip(heard, lens)) / (sum(lens) or 1), msg)
                     if job.cancelled:
                         raise InterruptedError
                     if job.skip_stage:
-                        raise smart.Skipped
+                        return
+                    try:
+                        transcripts[a["path"]] = smart.transcribe(a["path"], analyze.proxy_key(a["path"]), prog,
+                                                                  audio_src=(s.get("_skim") or {}).get(a["path"]))
+                    except InterruptedError:
+                        raise
+                    except smart.Skipped:
+                        return
+                    except Exception as e:  # one clip's sound can't be read: carry on without its words
+                        print("listening skipped", a["path"], e)
+                        with hlock:
+                            unheard.append(a["path"])
                     with hlock:
-                        heard[i] = f
-                        done = sum(1 for x in heard if x >= 1)
-                        msg = f"{done} of {len(speak)} clips heard, on fal" if on_fal else f"Clip {i + 1} of {len(speak)}: {note}"
-                        job.update(sum(h * l for h, l in zip(heard, lens)) / (sum(lens) or 1), msg)
-                if job.cancelled:
-                    raise InterruptedError
-                if job.skip_stage:
-                    return
-                transcripts[a["path"]] = smart.transcribe(a["path"], analyze.proxy_key(a["path"]), prog)
-                with hlock:
-                    heard[i] = 1.0
-            if on_fal:  # several clips at once: fal does the listening, this PC only takes out the sound
-                from concurrent.futures import ThreadPoolExecutor
-                with ThreadPoolExecutor(4) as ex:
-                    for _ in ex.map(listen, range(len(speak))):
-                        pass
-            else:
-                for i in range(len(speak)):
-                    if job.skip_stage:
-                        break
-                    listen(i)
-            if not job.skip_stage:
-                update_speed("transcribe_fal" if on_fal else "transcribe", (time.time() - t0) / foot)
-            job.skip_stage = False
+                        heard[i] = 1.0
+                if on_fal:  # several clips at once: fal does the listening, this PC only takes out the sound
+                    from concurrent.futures import ThreadPoolExecutor
+                    with ThreadPoolExecutor(4) as ex:
+                        for _ in ex.map(listen, range(len(speak))):
+                            pass
+                else:
+                    for i in range(len(speak)):
+                        if job.skip_stage:
+                            break
+                        listen(i)
+                if not job.skip_stage:
+                    update_speed("transcribe_fal" if on_fal else "transcribe", (time.time() - t0) / max(1.0, footage_s))
+                job.skip_stage = False
+        if want_words and not skim:
+            listen_to(analyses, foot)
         # 2b. Google AI picks the soundbites (podcasts, interviews, panels)
         ai, ai_note = {}, None
         if use_ai:
@@ -474,8 +609,15 @@ def run_generate(job: Job):
                         if job.cancelled:
                             raise InterruptedError
                         job.update((before + f * lens[i]) / (sum(lens) or 1), f"Clip {i + 1} of {len(speak)}: {note}")
-                    r = gemini.analyse_clip(a["path"], s.get("event_type", ""), lens[i], analyze.proxy_key(a["path"]), prog)
-                    ai[a["path"]] = r
+                    try:
+                        r = gemini.analyse_clip(a["path"], s.get("event_type", ""), lens[i], analyze.proxy_key(a["path"]), prog)
+                        ai[a["path"]] = r
+                    except gemini.AIError:
+                        raise
+                    except InterruptedError:
+                        raise
+                    except Exception as e:  # this clip couldn't be prepared for Google AI: the others still count
+                        print("Google AI skipped a clip", a["path"], e)
                 if not s.get("title") and s.get("ai_title") and ai:
                     s["title"] = next(iter(ai.values())).get("title") or ""
             except gemini.AIError as e:
@@ -486,16 +628,20 @@ def run_generate(job: Job):
             for pth, r_ in ai.items():
                 if transcripts.get(pth):
                     transcripts[pth] = _talk.apply_quotes(transcripts[pth], r_.get("bites"))
-        # 3. director (optional)
+        # 3. director (optional): never stops the video; without it EventCut chooses the story itself
         if s.get("director"):
             job.set_stage("director", "Director mode is choosing the story")
             cfg = load_settings()
-            if smart.month_spend() >= float(cfg.get("director_monthly_cap_usd", 20)):
-                raise RuntimeError("Director mode has reached this month's spending cap. Ask the admin to raise it.")
-            d = smart.director_plan(analyses, transcripts, s)
-            s["director_picks"] = {f"{k[0]}|{k[1]}": v for k, v in d["picks"].items()}
-            if d.get("title") and not s.get("title"):
-                s["title"] = d["title"]
+            try:
+                if smart.month_spend() >= float(cfg.get("director_monthly_cap_usd", 20)):
+                    raise RuntimeError("it has reached this month's spending cap")
+                d = smart.director_plan(analyses, transcripts, s)
+                s["director_picks"] = {f"{k[0]}|{k[1]}": v for k, v in d["picks"].items()}
+                if d.get("title") and not s.get("title"):
+                    s["title"] = d["title"]
+            except Exception as e:
+                why = str(e).splitlines()[0][:160] if str(e) else "it couldn't be reached"
+                ai_note = (ai_note + " " if ai_note else "") + f"Director mode wasn't used ({why}). EventCut chose the story itself."
         # 4. style + plan
         job.set_stage("plan", "Building the story")
         if s.get("style_name"):
@@ -514,23 +660,76 @@ def run_generate(job: Job):
             # automatic: new music for every version (library track for the mood if online, else an original)
             family = s.get("music_family") or story.music_family(s)
             job.update(0.3, "Choosing music")
-            music = audio.pick_auto_music(family, dur, seed, online=s.get("online_music", True))
+            music = audio.pick_auto_music(family, dur, seed, online=s.get("online_music", True), prompt=s.get("prompt", ""),
+                                          brief=(s.get("_music_brief") or {}).get("music"))
+            if music.get("epidemic_error"):
+                what = "an EventCut original track" if music.get("source") == "generated" else "a track from the free library"
+                notices.append(f"Epidemic Sound wasn't used for the music: {music['epidemic_error'].rstrip('.')}. EventCut used {what} instead.")
+            elif music.get("source") == "epidemic" and not music.get("version") and music.get("version_note"):
+                notices.append("Epidemic Sound's exact-length edit wasn't available (" + music["version_note"].rstrip(".") +
+                               "), so the track starts at its most popular part and fades out at the end.")
             s["music"] = music
+        if music.get("path") and "start" not in music and epidemic.enabled():
+            # an Epidemic Sound track picked by hand: start at its most popular section for short videos
+            mm = re.search(r"\[([^\]]+)\]\.mp3$", str(music["path"]))
+            if mm and str(Path(music["path"]).parent) == str(epidemic.FOLDER) and dur <= 75:
+                st0 = epidemic.highlight_start(mm.group(1), dur)
+                try:
+                    length = float(media.probe(music["path"]).get("duration") or 0)
+                except Exception:
+                    length = 0
+                if st0 and length and length - st0 < dur:
+                    st0 = max(0.0, length - dur - 1)
+                music = dict(music, start=st0)
+                s["music"] = music
         if music.get("path"):
-            grid = audio.detect_beats(music["path"])
+            grid = audio.shift_grid(audio.detect_beats(music["path"]), float(music.get("start") or 0))
         else:
             grid = audio.music_grid(music["mood"], dur, seed)
         plan = p.get("plan") or story.plan_edit(analyses, s, grid, transcripts, taste)
+        if skim and plan.get("shortened") and not p.get("plan"):
+            # not enough strong moments in the stretches studied so far: look closely at more of the footage, once
+            job.set_stage("analyse", "Looking closely at more moments")
+            more = quick.plan_windows([q for q in quicks if q["path"] not in full], dur, picks, order, boost=3.0)
+            redo = [q for q in quicks if q["path"] in more and more[q["path"]] != wins.get(q["path"])]
+            extra = [None] * len(redo)
+
+            def close_more(i):
+                q = redo[i]
+                if job.cancelled:
+                    raise InterruptedError
+                extra[i] = checked(lambda: quick.close_analysis(q, more[q["path"]]), q["path"])
+                job.update((i + 1) / max(1, len(redo)), f"{i + 1} of {len(redo)} clips")
+            run_parallel(close_more, len(redo), workers)
+            if any(extra):
+                newer = {a["path"]: a for a in extra if a}
+                analyses = [newer.get(a["path"], a) for a in analyses] + [a for pth, a in newer.items()
+                                                                           if pth not in {x["path"] for x in analyses}]
+                plan = story.plan_edit(analyses, s, grid, transcripts, taste)
+        if want_words and skim:  # fast watching: listen only to the clips that made it into the video
+            used = {sh["src"] for sh in plan.get("shots", [])}
+            pool = [a for a in analyses if a["path"] in used]
+            listen_to(pool, sum(float(a["info"].get("duration") or 0) for a in pool))
         s.pop("_ai", None)
         # Google AI colourist: gentle, per-clip corrections before the look, only for clips in the edit
         if gemini.cfg()["key"] and load_settings().get("google_colour", True) and s.get("preset") != "None":
             job.set_stage("colour", "Google AI is grading each clip")
             used = {sh["src"] for sh in plan.get("shots", [])}
-            s["ai_colour"] = ai_colour_pass([a for a in analyses if a["path"] in used], s, job)
+            s["ai_colour"] = ai_colour_pass([a for a in analyses if a["path"] in used], s, job, notices)
         if ai:
             plan["ai"] = {"used": True, "cost_usd": round(sum(v.get("usd", 0) for v in ai.values()), 4)}
         if ai_note:
-            plan["warning"] = (plan.get("warning") + " " if plan.get("warning") else "") + ai_note
+            notices.append(ai_note)
+        if unheard:
+            names = ", ".join(Path(x).name for x in unheard[:3]) + (f" and {len(unheard) - 3} more" if len(unheard) > 3 else "")
+            notices.append(f"The speech in {names} couldn't be heard (its sound track is damaged), so "
+                           f"{'those clips have' if len(unheard) > 1 else 'that clip has'} no captions.")
+        # the sound: music, sound effects and level changes, as editable data (the sound timeline edits it later)
+        if not s.get("sound"):
+            from . import soundplan
+            s["_epidemic_expected"] = epidemic.enabled()
+            s["sound"] = soundplan.build(plan, s, music, dur, np.random.default_rng((int(s.get("seed", 0)) * 7 + 3) % (2 ** 32)), notices)
+        plan["notices"] = notices
         if bad:
             names = ", ".join(Path(b[0]).name for b in bad[:4]) + (f" and {len(bad) - 4} more" if len(bad) > 4 else "")
             plan["warning"] = (plan.get("warning") + " " if plan.get("warning") else "") + \
@@ -560,10 +759,16 @@ def run_generate(job: Job):
             update_speed("render", (time.time() - t0) * 0.75 / dur)
             update_speed("finish", (time.time() - t0) * 0.25 / dur)
             results.append(r)
-        meta = {"settings": {k: v for k, v in s.items() if k not in ("director_picks", "match_look")}, "plan": plan,
+            if r.get("replaced") and not any("damaged part" in n for n in notices):
+                names = sorted({Path(x["was"]).name for x in r["replaced"]})
+                notices.append(f"{len(r['replaced'])} shot{'s' if len(r['replaced']) > 1 else ''} came from a damaged part of "
+                               f"{', '.join(names[:3])}{' and others' if len(names) > 3 else ''} and {'were' if len(r['replaced']) > 1 else 'was'} "
+                               "replaced with the next best moments.")
+        plan["notices"] = notices
+        meta = {"settings": {k: v for k, v in s.items() if k not in ("director_picks", "match_look") and not k.startswith("_")}, "plan": plan,
                 "outputs": results, "created": time.strftime("%Y-%m-%d %H:%M"), "user": job.user.get("email")}
         (out_dir / "project.json").write_text(json.dumps(meta, indent=1), "utf-8")
-        job.result = {"folder": str(out_dir), "outputs": results, "plan": plan, "version": out_dir.name}
+        job.result = {"folder": str(out_dir), "outputs": results, "plan": plan, "version": out_dir.name, "settings": meta["settings"]}
         job.state, job.stage, job.progress = "done", "Done", 1.0
         job.eta = {"stage_left": 0, "total_left": 0, "elapsed": round(time.time() - job.started)}
         job.push()
@@ -572,10 +777,64 @@ def run_generate(job: Job):
         job.state, job.stage = "cancelled", "Cancelled"
         job.push()
     except Exception as e:
-        traceback.print_exc()
-        job.state, job.stage, job.error = "failed", "Something went wrong", str(e).splitlines()[0][:300]
-        job.push()
+        fail_job(job, e)
         play_sound(False)
+
+
+def friendly_error(e) -> str:
+    """One plain sentence for the site, plus the useful line from FFmpeg when that's what failed."""
+    raw = str(e) or e.__class__.__name__
+    low = raw.lower()
+    if isinstance(e, MemoryError) or "out of memory" in low or "cannot allocate memory" in low or "bad_alloc" in low:
+        return "This PC ran out of memory. Close other apps, or split the footage into smaller projects, then resume."
+    if "no space left" in low or "disk full" in low or "errno 28" in low:
+        return "The disk is full. Free some space on the drive that holds the EventCut folder, then resume."
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    first = lines[0] if lines else raw
+    detail = next((l for l in reversed(lines[1:]) if not l.startswith("Conversion failed")), "")
+    return (first + (f" ({detail[:220]})" if detail else ""))[:400]
+
+
+def fail_job(job, e):
+    """Mark a job failed, keep which step it was on, and write the full details to Logs/ for support."""
+    tb = traceback.format_exc()
+    print(tb)
+    job.failed_stage = job.stage
+    job.state, job.error = "failed", friendly_error(e)
+    job.stage = f"Stopped while {job.stage[0].lower() + job.stage[1:]}" if job.stage else "Something went wrong"
+    try:
+        logs = LOGS
+        logs.mkdir(parents=True, exist_ok=True)
+        rec = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "version": VERSION, "job": job.id, "kind": job.kind, "title": job.title,
+               "clips": job.clips, "stage": job.failed_stage, "progress": round(job.progress, 3), "error": job.error, "detail": tb[-6000:]}
+        (logs / "last_error.json").write_text(json.dumps(rec, indent=1), "utf-8")
+        with open(logs / "errors.log", "a", encoding="utf-8") as f:
+            f.write(f"\n===== {rec['time']}  {job.kind}  {job.title}  (engine {VERSION})\nStep: {job.failed_stage}\n{tb}\n")
+    except Exception:
+        pass
+    job.push()
+
+
+def waveform(path, points=600):
+    """Peaks for drawing a track on the sound timeline (cached)."""
+    points = max(50, min(3000, int(points)))
+    out = WORK / "_waveforms" / (hashlib.sha1(f"{path}|{os.path.getsize(path)}|{points}".encode()).hexdigest()[:16] + ".json")
+    if out.exists():
+        return json.loads(out.read_text())
+    ff, _ = media.tools()
+    p = media.run([ff, "-v", "error", "-i", path, "-vn", "-ac", "1", "-ar", "4000", "-f", "f32le", "-"])
+    x = np.abs(np.frombuffer(p.stdout, np.float32))
+    dur = len(x) / 4000.0
+    if not len(x):
+        return {"duration": 0, "peaks": []}
+    step = max(1, len(x) // points)
+    n = len(x) // step
+    peaks = x[: n * step].reshape(n, step).max(axis=1)
+    peaks = peaks / (peaks.max() + 1e-9)
+    res = {"duration": round(dur, 3), "peaks": [round(float(v), 3) for v in peaks]}
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(res))
+    return res
 
 
 def run_remix(job: Job):
@@ -613,9 +872,7 @@ def run_remix(job: Job):
         job.push()
         play_sound(True)
     except Exception as e:
-        traceback.print_exc()
-        job.state, job.error = "failed", str(e).splitlines()[0][:300]
-        job.push()
+        fail_job(job, e)
         play_sound(False)
 
 
@@ -670,9 +927,7 @@ def run_recaption(job: Job):
         job.push()
         play_sound(True)
     except Exception as e:
-        traceback.print_exc()
-        job.state, job.error = "failed", str(e).splitlines()[0][:300]
-        job.push()
+        fail_job(job, e)
         play_sound(False)
 
 
@@ -703,13 +958,32 @@ def run_sort(job: Job):
         job.state, job.stage = "cancelled", "Cancelled"
         job.push()
     except Exception as e:
-        job.state, job.error = "failed", str(e).splitlines()[0][:300]
-        job.push()
+        fail_job(job, e)
     finally:
         gemini._wait_note.fn = None
 
 
+def _keep_awake(on: bool):
+    """Stop Windows going to sleep while a video is being made (the screen may still turn off)."""
+    if platform.system() != "Windows":
+        return
+    try:
+        import ctypes
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if on else 0))
+    except Exception:
+        pass
+
+
 def _queued(job, target):
+    _keep_awake(True)
+    try:
+        _queued_inner(job, target)
+    finally:
+        _keep_awake(False)
+
+
+def _queued_inner(job, target):
     heavy = job.kind == "generate"
     if heavy:
         with _QCOND:
@@ -859,7 +1133,7 @@ class Handler(BaseHTTPRequestHandler):
                 cfg = load_settings()
                 return self.send_json({"ok": True, "version": VERSION, "gpu": media.gpu_available(), "gpu_label": media.hardware().get("label"),
                                        "gpu_notes": media.hardware().get("notes", []),
-                                       "whisper": smart.speech_available(), "fal": falai.enabled(), "home": str(HOME),
+                                       "whisper": smart.speech_available(), "fal": falai.enabled(), "epidemic": epidemic.enabled(), "home": str(HOME),
                                        "linked": bool(cfg.get("supabase_url")), "cpu_threads": os.cpu_count()})
             if path == "/link" and method == "POST":
                 # first sign-in on this PC: the site tells the engine which backend to check approvals against
@@ -941,7 +1215,7 @@ class Handler(BaseHTTPRequestHandler):
             proxy = analyze.CACHE / f"{analyze.proxy_key(p)}_proxy.mp4"
             if proxy.exists() and proxy.stat().st_size > 1000 and media.probe(str(proxy)).get("pix_fmt") in ("yuv420p", "yuvj420p"):
                 return self.send_json({"path": str(proxy), "start": 0.3})  # the working copy, if browsers can play it
-            out = HOME / "Projects" / "_previews" / f"{analyze.proxy_key(p)}.mp4"
+            out = WORK / "_previews" / f"{analyze.proxy_key(p)}.mp4"
             out.parent.mkdir(parents=True, exist_ok=True)
             if not out.exists():
                 ff, _ = media.tools()
@@ -973,8 +1247,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/library/upload" and method == "POST":
             name = safe_name(unquote(self.headers.get("X-Filename", "upload.mp3")), "upload.mp3")
             folder = self.headers.get("X-Folder", "Uploads")
-            dest_dir = {"Uploads": audio.LIB / "Uploads", "Logos": HOME / "Assets" / "Logos", "Fonts": HOME / "Assets" / "Fonts",
-                        "LUTs": HOME / "Presets" / "LUTs", "Assets": HOME / "Assets"}.get(folder, audio.LIB / "Uploads")
+            dest_dir = {"Uploads": MUSIC_UPLOADS, "Logos": LOGOS, "Fonts": FONTS,
+                        "LUTs": LOOKS, "Assets": WORK / "Brand kit"}.get(folder, MUSIC_UPLOADS)
             dest_dir.mkdir(parents=True, exist_ok=True)
             data = self.body()
             if folder == "Logos" and not render.logo_bytes_ok(data, name):
@@ -989,6 +1263,91 @@ class Handler(BaseHTTPRequestHandler):
             est = gemini.estimate(secs)
             est.update(seconds=round(secs), enabled=gemini.enabled(), month_spend=round(gemini.month_spend(), 3), cap=gemini.cfg()["cap"])
             return self.send_json(est)
+        if path == "/selftest" and method == "POST":
+            from . import selftest
+            b = self.body()
+            clip = b.get("clip")
+            if clip and not path_allowed(clip):
+                clip = None
+            return self.send_json({"results": selftest.run(clip, bool(b.get("downloads")))})
+        if path == "/last-error":
+            f = LOGS / "last_error.json"
+            return self.send_json(json.loads(f.read_text("utf-8")) if f.exists() else {})
+        if path == "/open-logs" and method == "POST":
+            LOGS.mkdir(parents=True, exist_ok=True)
+            open_in_explorer(str(LOGS))
+            return self.send_json({"ok": True})
+        if path == "/epidemic/search":
+            try:
+                pg = max(1, int(q.get("page", ["1"])[0]))
+                r = epidemic.search(q.get("q", [""])[0], limit=30, offset=(pg - 1) * 30, instrumental=q.get("instrumental", ["0"])[0] == "1")
+                r["more"] = len(r["results"]) >= 30
+                return self.send_json(r)
+            except epidemic.EpidemicError as e:
+                return self.send_json({"error": str(e), "results": []}, 502)
+        if path == "/epidemic/preview" and method == "POST":
+            b = self.body()
+            try:
+                start = epidemic.highlight_start(str(b["id"]), 45)
+                return self.send_json({"path": epidemic.preview(str(b["id"]), start)})
+            except epidemic.EpidemicError as e:
+                return self.send_json({"error": str(e)}, 502)
+        if path == "/epidemic/use" and method == "POST":
+            b = self.body()
+            try:
+                pth = epidemic.download(str(b["id"]), b.get("title", ""), b.get("artist", ""))
+                dur = float(b.get("duration") or 60)
+                start = epidemic.highlight_start(str(b["id"]), dur) if dur <= 75 else 0.0
+                length = float(b.get("length") or 0)
+                if start and length and length - start < dur:
+                    start = max(0.0, length - dur - 1)
+                return self.send_json({"path": pth, "start": start, "title": f"{b.get('title', '')} by {b.get('artist', '')}",
+                                       "source": "epidemic", "license": "Epidemic Sound"})
+            except epidemic.EpidemicError as e:
+                return self.send_json({"error": str(e)}, 502)
+        if path == "/epidemic/similar":
+            try:
+                return self.send_json({"results": epidemic.similar(q.get("id", [""])[0], 15)})
+            except epidemic.EpidemicError as e:
+                return self.send_json({"error": str(e), "results": []}, 502)
+        if path == "/epidemic/sfx":
+            try:
+                pg = max(1, int(q.get("page", ["1"])[0]))
+                res = epidemic.sfx_search(q.get("q", ["whoosh"])[0] or "whoosh", 30, (pg - 1) * 30)
+                return self.send_json({"results": res, "more": len(res) >= 30})
+            except epidemic.EpidemicError as e:
+                return self.send_json({"error": str(e), "results": []}, 502)
+        if path == "/epidemic/sfx/use" and method == "POST":
+            b = self.body()
+            try:
+                pth = epidemic.sfx_download(str(b["id"]), b.get("title", "Sound effect"))
+                return self.send_json({"path": pth, "length": round(float(media.probe(pth).get("duration") or 0), 2),
+                                       "source": "Epidemic Sound"})
+            except epidemic.EpidemicError as e:
+                return self.send_json({"error": str(e)}, 502)
+        if path == "/epidemic/sfx/preview" and method == "POST":
+            # effects are short: the download link doubles as the preview (Epidemic: "serves both download and preview")
+            b = self.body()
+            try:
+                hit = epidemic._local_sfx(str(b["id"]))
+                if hit:
+                    return self.send_json({"path": str(hit)})
+                d = epidemic._req(f"/v0/sound-effects/{b['id']}/download", {"format": "mp3", "quality": "normal"})
+                return self.send_json({"url": d.get("url")})
+            except epidemic.EpidemicError as e:
+                return self.send_json({"error": str(e)}, 502)
+        if path == "/waveform":
+            pth = q.get("path", [""])[0]
+            if not pth or not path_allowed(pth) or not os.path.isfile(pth):
+                return self.send_json({"error": "File not available"}, 404)
+            return self.send_json(waveform(pth, int(q.get("points", ["600"])[0])))
+        if path == "/epidemic/test" and method == "POST":
+            tb = self.body()
+            try:
+                epidemic.test_key((tb.get("key") or epidemic.cfg()["key"]).strip())
+                return self.send_json({"ok": True})
+            except epidemic.EpidemicError as e:
+                return self.send_json({"ok": False, "error": str(e)}, 400)
         if path == "/fal/test" and method == "POST":
             tb = self.body()
             key = (tb.get("key") or falai.cfg()["key"]).strip()
@@ -1024,7 +1383,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(res)
         if path == "/music-preview" and method == "POST":
             b = self.body()
-            out = audio.LIB / "_previews" / f"{re.sub('[^A-Za-z]', '', b.get('mood', 'x'))}.wav"
+            out = WORK / "_previews_audio" / f"{re.sub('[^A-Za-z]', '', b.get('mood', 'x'))}.wav"
             if not out.exists():
                 audio.write_wav(out, audio.generate_music(b.get("mood", "Upbeat Afro House"), 20, 6))
             return self.send_json({"path": str(out)})
@@ -1083,11 +1442,13 @@ class Handler(BaseHTTPRequestHandler):
                 b = self.body()
                 for k in ("notify_sound", "notify_volume", "director_mode_api_key", "director_monthly_cap_usd", "director_mode_model",
                           "google_api_key", "google_model", "google_monthly_cap_usd", "use_google_ai", "google_prices", "speech_language",
-                          "google_colour", "max_parallel_jobs", "fal_api_key", "use_fal", "analyse_workers"):
+                          "google_colour", "max_parallel_jobs", "fal_api_key", "use_fal", "analyse_workers",
+                          "epidemic_api_key", "use_epidemic", "epidemic_auto"):
                     if k in b:
                         cfg[k] = b[k]
                 save_settings(cfg)
-            safe = {k: v for k, v in cfg.items() if k not in ("director_mode_api_key", "supabase_anon_key", "google_api_key", "fal_api_key")}
+            safe = {k: v for k, v in cfg.items() if k not in ("director_mode_api_key", "supabase_anon_key", "google_api_key", "fal_api_key", "epidemic_api_key")}
+            safe["epidemic_key_set"] = bool(cfg.get("epidemic_api_key"))
             safe["fal_key_set"] = bool(cfg.get("fal_api_key"))
             safe["fal_month_minutes"] = round(falai.month_minutes(), 1)
             safe["fal_note"] = falai._broken["why"] if not falai.enabled() and cfg.get("fal_api_key") else ""
@@ -1101,17 +1462,18 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/brand-kit" and method == "POST":
             # Team Brand Kit sync: the site sends logos (SVG already rasterised to PNG in the browser), fonts and theme
             kit = self.body()
-            (HOME / "Assets" / "brand-kit.json").write_text(json.dumps({k: v for k, v in kit.items() if k != "files"}, indent=1))
+            (WORK / "Brand kit").mkdir(parents=True, exist_ok=True)
+            (WORK / "Brand kit" / "brand-kit.json").write_text(json.dumps({k: v for k, v in kit.items() if k != "files"}, indent=1))
             saved, bad = [], []
             for f in kit.get("files", []):
                 ftype = f.get("type") or ("font" if str(f.get("name", "")).lower().endswith((".ttf", ".otf")) else "logo")
-                sub = {"logo": "Logos", "font": "Fonts", "lut": "../Presets/LUTs"}.get(ftype, "Logos")
+                folder = {"logo": LOGOS, "font": FONTS, "lut": LOOKS}.get(ftype, LOGOS)
                 name = safe_name(f.get("name", ""), "logo.png")
                 data = base64.b64decode(f.get("data") or "")
                 if ftype == "logo" and not render.logo_bytes_ok(data, name):
                     bad.append(name)
                     continue
-                dest = (HOME / "Assets" / sub / name).resolve()
+                dest = (folder / name).resolve()
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_bytes(data)
                 saved.append(name)
@@ -1120,17 +1482,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def list_assets(self):
         out = {}
-        for sub in ("Logos", "Fonts"):
-            d = HOME / "Assets" / sub
+        for sub, d in (("Logos", LOGOS), ("Fonts", FONTS)):
             out[sub.lower()] = [{"name": f.name, "path": str(f)} for f in sorted(d.glob("*")) if f.is_file()] if d.exists() else []
-        kit = HOME / "Assets" / "brand-kit.json"
+        kit = WORK / "Brand kit" / "brand-kit.json"
         out["brand_kit"] = json.loads(kit.read_text()) if kit.exists() else None
-        out["luts"] = [{"name": f.stem, "path": str(f)} for f in sorted((HOME / "Presets" / "LUTs").glob("*.cube"))]
+        out["luts"] = [{"name": f.stem, "path": str(f)} for f in sorted(LOOKS.glob("*.cube"))]
         return out
 
     def list_projects(self):
         res = []
-        for pj in sorted((HOME / "Exports").glob("*/Version */project.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:200]:
+        for pj in sorted(FINISHED.glob("*/Version */project.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:200]:
             try:
                 d = json.loads(pj.read_text("utf-8"))
                 res.append({"event": pj.parent.parent.name, "version": pj.parent.name, "folder": str(pj.parent),
@@ -1197,7 +1558,7 @@ class Handler(BaseHTTPRequestHandler):
     def thumb(self, p, t, w):
         if not p or not path_allowed(p):
             return self.send_json({"error": "File not available"}, 404)
-        cache = HOME / "Projects" / "_thumbs"
+        cache = WORK / "_thumbs"
         cache.mkdir(parents=True, exist_ok=True)
         out = cache / (hashlib.sha1(f"{p}|{t}|{w}".encode()).hexdigest()[:16] + ".jpg")
         if not out.exists():

@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from . import audio, fxtrans, grade, media
-from .config import HOME, tools
+from .config import FONTS, HOME, LOGOS, SFX_ORIGINALS, tools
 
 FORMATS = {"9:16": (1080, 1920), "16:9": (1920, 1080), "1:1": (1080, 1080), "4:5": (1080, 1350)}
 # transition name -> (FFmpeg xfade style, duration in seconds)
@@ -40,7 +40,7 @@ TRANS_SFX = {"whip_l": "whoosh", "whip_r": "whoosh", "whip_u": "whoosh", "whip":
 def _font(name="Poppins-Bold.ttf"):
     import sys
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
-    user = HOME / "Assets" / "Fonts"
+    user = FONTS
     for d in (user, base / "fonts"):
         p = d / name
         if p.exists():
@@ -231,6 +231,44 @@ class Renderer:
         return grade.lab_stats(cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255)
 
     # ------------------------------------------------------------- one shot
+    def render_shot_safe(self, i, shot, extra_tail=0.0):
+        """Render a shot; if its part of the file is damaged, swap in the best spare moment instead of failing."""
+        import threading
+        try:
+            return self.render_shot(i, shot, extra_tail)
+        except InterruptedError:
+            raise
+        except Exception as first:
+            if not hasattr(self, "_spare_lock"):
+                self._spare_lock = threading.Lock()
+            need = shot["length"] + extra_tail
+            bad_src = shot["src"]
+            for _ in range(4):
+                with self._spare_lock:
+                    spares = self.plan.setdefault("spares", [])
+                    sp = next((x for x in spares if x["end"] - x["start"] >= need - 0.01 and x["src"] != bad_src
+                               and x["src"] in self.an), None)
+                    if sp is None:
+                        raise first
+                    spares.remove(sp)
+                old_src = shot["src"]
+                slack = (sp["end"] - sp["start"]) - need
+                cin = sp["start"] + max(0.0, slack / 2)
+                shot.update(src=sp["src"], kind=sp["kind"], **{"in": round(cin, 3), "out": round(cin + shot["length"], 3)},
+                            face_x=sp.get("face_x", 0.5), fps=sp.get("fps", 25), log=sp.get("log"), moment=sp.get("moment", 0),
+                            score=sp.get("score", 0), replaced=old_src)
+                try:
+                    out = self.render_shot(i, shot, extra_tail)
+                    with self._spare_lock:
+                        self.replaced.append({"shot": i, "was": old_src, "now": shot["src"]})
+                    return out
+                except InterruptedError:
+                    raise
+                except Exception:
+                    bad_src = shot["src"]
+                    continue
+            raise first
+
     def render_shot(self, i, shot, extra_tail=0.0):
         out = self.work / f"shot_{i:04d}.mp4"
         src = shot["src"]
@@ -474,11 +512,11 @@ class Renderer:
 
     # ------------------------------------------------------------- graphics
     def logo_file(self):
-        """The chosen logo, else the most recently added readable one in Assets/Logos (images or animated logos)."""
+        """The chosen logo, else the most recently added readable one in the Logos folder (images or animated logos)."""
         logo = self.s.get("logo")
         if logo and Path(logo).is_file() and logo_path_ok(Path(logo)):
             return Path(logo)
-        folder = HOME / "Assets" / "Logos"
+        folder = LOGOS
         files = [f for f in folder.glob("*") if f.is_file() and f.suffix.lower() in LOGO_EXT] if folder.exists() else []
         for f in sorted(files, key=lambda f: f.stat().st_mtime, reverse=True):
             if logo_path_ok(f):
@@ -692,15 +730,24 @@ class Renderer:
         amb = np.frombuffer(p.stdout, dtype=np.float32).reshape(-1, 2)
         n = int(total * sr)
         amb = np.pad(amb, ((0, max(0, n - len(amb))), (0, 0)))[:n]
-        # music
-        m = self.s.get("music") or {}
+        # music (the sound plan, when there is one, says exactly which part, fades and level changes)
+        snd = self.s.get("sound") or {}
+        m = dict(self.s.get("music") or {})
+        if snd.get("music"):
+            m.update({k: v for k, v in snd["music"].items() if v is not None})
         if m.get("path") and Path(m["path"]).exists():
             mp = media.run([self.ffmpeg, "-v", "error", "-ss", str(m.get("start", 0)), "-i", m["path"], "-t", f"{total:.3f}",
                             "-ac", "2", "-ar", str(sr), "-f", "f32le", "-"])
             music = np.frombuffer(mp.stdout, dtype=np.float32).reshape(-1, 2).copy()
             music = np.pad(music, ((0, max(0, n - len(music))), (0, 0)))[:n]
-            fade = int(1.2 * sr)
-            music[-fade:] *= np.linspace(1, 0, fade)[:, None]
+            fi = int(max(0.0, float(m.get("fade_in", 0) or 0)) * sr)
+            fo = int(max(0.0, float(m.get("fade_out", 1.2) if m.get("fade_out") is not None else 1.2)) * sr)
+            if fi > 1:
+                fi = min(fi, n)
+                music[:fi] *= np.linspace(0, 1, fi)[:, None]
+            if fo > 1:
+                fo = min(fo, n)
+                music[n - fo:] *= np.linspace(1, 0, fo)[:, None]
         else:
             mood = m.get("mood") or plan.get("mood", "Upbeat Afro House")
             gen = audio.generate_music(mood, total, plan.get("drop_at"), seed=int(self.s.get("seed", 0)))
@@ -721,9 +768,26 @@ class Renderer:
         duck_db = 12 if talk else 7
         duck = 10 ** (-duck_db * speech / 20)
         amb_gain = (0.9 if talk else 0.32) * v_speech
-        mix = amb * amb_gain + music * (0.55 if talk else 0.9) * v_music * duck[:, None]
+        # level changes along the video (lift for the peak, softer for emotional moments, or the user's own points)
+        level = np.ones(n, dtype=np.float32) * (10 ** (float(m.get("gain_db", 0) or 0) / 20))
+        pts = sorted(snd.get("gains") or [], key=lambda g: g["t"])
+        if pts:
+            env_db = np.zeros(n, dtype=np.float32)
+            ramp = int(0.4 * sr)
+            prev_db = 0.0
+            for g in pts:
+                i0 = int(max(0.0, float(g["t"])) * sr)
+                if i0 >= n:
+                    break
+                db = float(g["db"])
+                r = min(ramp, n - i0)
+                env_db[i0:i0 + r] = np.linspace(prev_db, db, r) if r > 0 else db
+                env_db[i0 + r:] = db
+                prev_db = db
+            level *= 10 ** (env_db / 20)
+        mix = amb * amb_gain + music * (0.55 if talk else 0.9) * v_music * (duck * level)[:, None]
         # sound effects at transitions + custom placements
-        sfx_dir = audio.LIB / "SFX"
+        sfx_dir = SFX_ORIGINALS
         cache = {}
 
         def load(name):
@@ -738,7 +802,10 @@ class Renderer:
                 cache[name] = np.frombuffer(r.stdout, dtype=np.float32).reshape(-1, 2)
             return cache[name]
         placements = list(self.s.get("sfx") or [])
-        if self.s.get("auto_sfx", True):
+        if snd:
+            placements = [{"name": x["path"], "at": float(x["at"]), "gain": float(x.get("gain", 0.4))} for x in snd.get("sfx", [])
+                          if not x.get("muted")]
+        elif self.s.get("auto_sfx", True):
             fams = audio.sfx_families()
             import zlib
             rng = np.random.default_rng(zlib.crc32(f"sfx|{self.s.get('seed', 0)}".encode()))
@@ -789,8 +856,9 @@ class Renderer:
             self.lut_for_source(src)
         files = [None] * len(shots)
         done = 0
+        self.replaced = []
         with ThreadPoolExecutor(workers) as pool:
-            futs = {pool.submit(self.render_shot, i, s, tails.get(i, 0.0)): i for i, s in enumerate(shots)}
+            futs = {pool.submit(self.render_shot_safe, i, s, tails.get(i, 0.0)): i for i, s in enumerate(shots)}
             for f in as_completed(futs):
                 self.check()
                 files[futs[f]] = f.result()
@@ -832,6 +900,8 @@ class Renderer:
         outputs = self.export(video, mix)
         self.progress("export", 1.0)
         outputs["seconds"] = round(time.time() - t0, 1)
+        if getattr(self, "replaced", None):
+            outputs["replaced"] = self.replaced
         return outputs
 
     def write_srt(self, words):
@@ -860,6 +930,9 @@ class Renderer:
                    "-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart", "-shortest", str(full)])
         out = {"video": str(full), "format": self.s.get("format"), "width": self.W, "height": self.H}
         if self.preview:
+            if self.s.get("sound"):
+                from . import soundplan
+                out["sound"] = soundplan.sound_list(self.s["sound"])
             return out
         wants = set(self.s.get("exports") or ["video", "video_only", "audio", "thumbnail"])
         if "video_only" in wants:
@@ -885,6 +958,12 @@ class Renderer:
             out["credits"] = str(cf)
         if (self.s.get("music") or {}).get("title"):
             out["music"] = (self.s.get("music") or {}).get("title")
+        if self.s.get("sound"):  # exactly what music and effects are in this video, and where each came from
+            from . import soundplan
+            out["sound"] = soundplan.sound_list(self.s["sound"])
+            sl = Path(f"{stem}_sound-list.txt")
+            sl.write_text(soundplan.sound_list_text(self.s["sound"], full.name), "utf-8")
+            out["sound_list"] = str(sl)
         return out
 
     def thumbnail(self, video):

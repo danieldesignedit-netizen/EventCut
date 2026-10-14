@@ -16,10 +16,10 @@ import urllib.request
 from pathlib import Path
 
 from . import media
-from .config import HOME, load_settings
+from .config import HOME, WORK, load_settings
 
 API = os.environ.get("EVENTCUT_GEMINI_API", "https://generativelanguage.googleapis.com")  # override only for testing
-CACHE = HOME / "Projects" / "_ai"
+CACHE = WORK / "_ai"
 PROMPT_VERSION = "p4"
 # Tokens Google counts per second of video at low media resolution, one frame a second (70) plus sound (25).
 VIDEO_TOK_S, AUDIO_TOK_S = 70, 25
@@ -503,3 +503,196 @@ say which event it shows: one of {", ".join(e["id"] for e in events)}, or "unsur
         ev = str(f.get("event", "unsure"))
         out[n] = ev if ev in ok else "unsure"
     return out
+
+
+# ------------------------------------------------------------------ picking the best moments of a big event
+PICK_VERSION = "m1"
+PICK_SCHEMA = {"type": "OBJECT", "properties": {
+    "moments": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+        "start": {"type": "STRING"}, "end": {"type": "STRING"}, "what": {"type": "STRING"},
+        "kind": {"type": "STRING"}, "score": {"type": "NUMBER"}}, "required": ["start", "end", "what", "score"]}},
+    "music": {"type": "OBJECT", "properties": {
+        "search": {"type": "STRING"}, "alternatives": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "bpm_min": {"type": "NUMBER"}, "bpm_max": {"type": "NUMBER"}, "vocals": {"type": "BOOLEAN"}}},
+    "sfx": {"type": "ARRAY", "items": {"type": "STRING"}},
+    "summary": {"type": "STRING"}},
+    "required": ["moments"]}
+
+
+def why_not(e) -> str:
+    """Plain reason Google AI wasn't used, for the notice on the video."""
+    m = str(e)
+    if "Add your Google AI key" in m or "No Google AI key" in m:
+        return "there is no Google AI key in Settings"
+    if "switched off" in m:
+        return "Google AI is switched off in Settings"
+    if "spending cap" in m:
+        return "this month's Google AI spending cap has been reached (raise it in Settings)"
+    if "rejected the API key" in m:
+        return "Google rejected the API key (check it in Settings)"
+    if "usage limit" in m or "(429)" in m:
+        return "Google's usage limit was reached (wait a few minutes, or turn on billing for the key)"
+    if "Couldn't reach Google AI" in m:
+        return "the internet connection to Google AI was lost"
+    return m[:200] or "Google AI returned an error"
+
+
+def _pick_prompt(event_type, direction, duration, part, parts, minutes):
+    return f"""You are a senior editor cutting a {int(duration)}-second social video of a {event_type or 'company event'}.
+This video is part {part} of {parts} of the raw footage ({minutes} minutes), made of many separate camera clips joined end to end
+(each jump in picture is a new clip). It is a small preview: 2 pictures a second, low quality. Judge content, not image quality.
+
+Editor's direction (follow it closely): {direction or '(none: choose what makes the best story for this event)'}
+
+Find the moments worth putting in the video: the action and emotion people would want to see (for example goals,
+celebrations, cheering crowds, handshakes, gifts being given and received, speeches with strong lines, laughter,
+trophies and medals, group photos). Skip setup, idle waiting, backs of heads, blurry or empty shots and repeats.
+Speakers may use Nigerian Pidgin English, English or a mix.
+
+Return up to 25 moments, best first. For each:
+- start, end: seconds from the start of THIS preview (decimals, e.g. "754.5"); 2 to 12 seconds long, inside one clip.
+- what: what happens, in under 12 words. kind: one word (goal, celebration, crowd, handshake, gift, speech, trophy, group, other).
+- score 1-10: how much it belongs in the video given the direction.
+
+Also suggest the music for the whole video (music.search: a short search for a music library like "uplifting afrobeats
+celebration", music.alternatives: 2 other searches, bpm_min and bpm_max, vocals: true only if vocals suit the video),
+up to 6 short sound-effect searches that fit (e.g. "fast whoosh transition", "crowd cheer swell", "cinematic impact"),
+and a one-sentence summary of this part."""
+
+
+def build_montage(parts, out: Path):
+    """Join skims into one small preview (640x360, 2 pictures a second) for Google AI."""
+    if out.exists() and out.stat().st_size > 1000:
+        return out
+    ff, _ = media.tools()
+    lst = out.with_suffix(".txt")
+    lst.write_text("".join("file '" + str(p).replace("'", "'\\''") + "'\n" for p in parts), "utf-8")
+    tmp = out.with_suffix(".part.mp4")
+    media.run([ff, "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(lst),
+               "-vf", "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=2",
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "34", "-c:a", "aac", "-b:a", "32k", "-ac", "1", "-ar", "16000",
+               "-movflags", "+faststart", str(tmp)])
+    os.replace(tmp, out)
+    try:
+        lst.unlink()
+    except OSError:
+        pass
+    return out
+
+
+def pick_moments(clips, event_type, direction, duration, progress=None, chunk_s=2400):
+    """clips: [(path, skim_path, seconds)] in the order things happened. Returns
+    {"picks": [{path, start, end, what, kind, score}], "music": {...}, "sfx": [...], "usd": float, "model": str}.
+    Raises AIError with a plain reason when Google AI can't be used."""
+    c = cfg()
+    if not c["key"]:
+        raise AIError("No Google AI key in Settings.")
+    if not c["use"]:
+        raise AIError("Google AI is switched off in Settings.")
+    if month_spend() >= c["cap"]:
+        raise AIError(f"Google AI has reached this month's spending cap (US${c['cap']:.0f}).")
+    say = progress or (lambda f, note="": None)
+    _wait_note.fn = lambda note: say(0.05, note)
+    _wait_note.max = 15 * 60
+    # split the event into parts of about 40 minutes
+    chunks, cur, cur_s = [], [], 0.0
+    for item in clips:
+        if cur and cur_s + item[2] > chunk_s:
+            chunks.append(cur)
+            cur, cur_s = [], 0.0
+        cur.append(item)
+        cur_s += item[2]
+    if cur:
+        chunks.append(cur)
+    model = pick_model(c["key"], c["tier"])
+    folder = CACHE / "picks"
+    folder.mkdir(parents=True, exist_ok=True)
+    results = [None] * len(chunks)
+    done = [0]
+    import concurrent.futures as cf
+
+    def one(k):
+        ch = chunks[k]
+        tag = hashlib.sha1(json.dumps([[Path(sk).name for _, sk, _ in ch], event_type, direction, int(duration), c["tier"],
+                                       PICK_VERSION, k, len(chunks)]).encode()).hexdigest()[:16]
+        cached = folder / f"{tag}.json"
+        if cached.exists():
+            results[k] = json.loads(cached.read_text("utf-8"))
+        else:
+            # offsets from the skims' real lengths, so times map back to the right clip
+            offs, t = [], 0.0
+            for path, sk, _ in ch:
+                d = float(media.probe(str(sk)).get("duration") or 0)
+                offs.append((t, t + d, path))
+                t += d
+            mont = build_montage([sk for _, sk, _ in ch], folder / f"{tag}.mp4")
+            f = upload(c["key"], mont)
+            try:
+                resp = generate_with(c["key"], model, f["uri"], _pick_prompt(event_type, direction, duration, k + 1, len(chunks), int(t // 60)),
+                                     PICK_SCHEMA)
+            finally:
+                try:
+                    _req("DELETE", f"{API}/v1beta/{f['name']}", c["key"], timeout=20)
+                except Exception:
+                    pass
+            spent = log_spend(resp.get("usageMetadata", {}), c["tier"])
+            data = _json_from(resp)
+            picks = []
+            for m in data.get("moments") or []:
+                s, e = _parse_t(m.get("start")), _parse_t(m.get("end"))
+                if e <= s:
+                    e = s + 4
+                mid = (s + e) / 2
+                for a0, a1, path in offs:
+                    if a0 <= mid < a1:
+                        picks.append({"path": path, "start": round(max(0.0, s - a0), 2), "end": round(min(a1 - a0, e - a0), 2),
+                                      "what": str(m.get("what", ""))[:120], "kind": str(m.get("kind", "other"))[:20],
+                                      "score": float(m.get("score") or 5)})
+                        break
+            results[k] = {"picks": picks, "music": data.get("music") or {}, "sfx": [str(x)[:60] for x in (data.get("sfx") or [])][:8],
+                          "summary": str(data.get("summary", ""))[:300], "usd": round(spent, 4)}
+            cached.write_text(json.dumps(results[k]), "utf-8")
+            results[k] = dict(results[k], fresh=True)
+            try:
+                mont.unlink()
+            except OSError:
+                pass
+        done[0] += 1
+        say(done[0] / len(chunks), f"Google AI watched part {done[0]} of {len(chunks)}")
+    errors = []
+    with cf.ThreadPoolExecutor(3) as ex:
+        futs = [ex.submit(one, k) for k in range(len(chunks))]
+        for fu in futs:
+            try:
+                fu.result()
+            except AIError as e:
+                errors.append(e)
+            except Exception as e:
+                errors.append(AIError(str(e).splitlines()[0][:200]))
+    ok = [r for r in results if r]
+    if not ok:
+        raise errors[0] if errors else AIError("Google AI returned nothing.")
+    picks = [p for r in ok for p in r["picks"]]
+    music = next((r["music"] for r in ok if r.get("music") and r["music"].get("search")), {})
+    sfx = []
+    for r in ok:
+        for x in r.get("sfx", []):
+            if x.lower() not in [y.lower() for y in sfx]:
+                sfx.append(x)
+    return {"picks": picks, "music": music, "sfx": sfx[:10], "summaries": [r.get("summary", "") for r in ok], "model": model,
+            "usd": round(sum(r.get("usd", 0) for r in ok if r.get("fresh")), 4), "partial": len(ok) < len(chunks),
+            "partial_reason": why_not(errors[0]) if errors and len(ok) < len(chunks) else ""}
+
+
+def generate_with(key, model, file_uri, prompt, schema):
+    body = {"contents": [{"role": "user", "parts": [{"file_data": {"mime_type": "video/mp4", "file_uri": file_uri}}, {"text": prompt}]}],
+            "generationConfig": {"temperature": 0.3, "response_mime_type": "application/json", "media_resolution": "MEDIA_RESOLUTION_LOW",
+                                 "response_schema": schema}}
+    try:
+        return _req("POST", f"{API}/v1beta/models/{model}:generateContent", key, body=body, timeout=900)
+    except AIError as e:
+        if "(400)" in str(e):
+            body["generationConfig"].pop("media_resolution", None)
+            body["generationConfig"].pop("response_schema", None)
+            return _req("POST", f"{API}/v1beta/models/{model}:generateContent", key, body=body, timeout=900)
+        raise

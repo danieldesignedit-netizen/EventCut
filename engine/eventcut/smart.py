@@ -9,9 +9,9 @@ from pathlib import Path
 import numpy as np
 
 from . import media, grade
-from .config import HOME, load_settings
+from .config import HOME, STYLES, WORK, load_settings
 
-TRANS_CACHE = HOME / "Projects" / "_transcripts"
+TRANS_CACHE = WORK / "_transcripts"
 _whisper = None
 
 
@@ -41,7 +41,7 @@ def _load_whisper():
     import sys
     from faster_whisper import WhisperModel
     bundled = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent)) / "models" / "whisper"
-    cpu_root = str(bundled) if bundled.exists() else str(HOME / "Projects" / "_models")
+    cpu_root = str(bundled) if bundled.exists() else str(WORK / "_models")
     if media.nvidia_ok():
         try:
             m = WhisperModel("small", device="cuda", compute_type="float16", download_root=cpu_root)
@@ -63,7 +63,7 @@ def _audio_16k(path: str) -> np.ndarray:
     return np.frombuffer(p.stdout, np.float32)
 
 
-def transcribe(path: str, key: str, progress=None) -> list:
+def transcribe(path: str, key: str, progress=None, audio_src: str = None) -> list:
     """Word-level transcript with faster-whisper. Cached per file, so a stopped run picks up where it left off.
 
     progress(fraction, note) is called often; it may raise Skipped (keep partial words) or InterruptedError (cancel)."""
@@ -79,7 +79,7 @@ def transcribe(path: str, key: str, progress=None) -> list:
     from . import falai
     if falai.enabled():  # fal: the same Whisper on cloud graphics cards, minutes instead of hours
         try:
-            words = falai.transcribe(path, PIDGIN_PROMPT if lang == "pcm" else "", progress)
+            words = falai.transcribe(audio_src or path, PIDGIN_PROMPT if lang == "pcm" else "", progress)
             out.write_text(json.dumps(words), "utf-8")
             return words
         except Skipped:
@@ -91,7 +91,7 @@ def transcribe(path: str, key: str, progress=None) -> list:
     if not whisper_available():
         return []
     with _WLOCK:  # one local listen at a time (if fal stopped mid-run, clips queue here)
-        return _transcribe_local(path, out, lang, progress)
+        return _transcribe_local(audio_src or path, out, lang, progress)
 
 
 _WLOCK = threading.Lock()
@@ -187,14 +187,14 @@ def build_style(name: str, paths: list) -> dict:
              "p90_shot": round(float(shots[int(len(shots) * 0.9) - 1]), 3), "max_shot": round(float(max(shots)), 3),
              "luma": round(float(np.mean(lums)), 3), "saturation": round(float(np.mean(sats)), 3),
              "lab": lab, "lufs": round(float(np.mean(lufs)), 1) if lufs else -14.0, "created": time.strftime("%Y-%m-%d")}
-    folder = HOME / "Styles"
+    folder = STYLES
     folder.mkdir(parents=True, exist_ok=True)
     (folder / f"{name}.json").write_text(json.dumps(style, indent=1), "utf-8")
     return style
 
 
 def list_styles() -> list:
-    folder = HOME / "Styles"
+    folder = STYLES
     out = []
     for f in sorted(folder.glob("*.json")) if folder.exists() else []:
         try:
@@ -207,7 +207,7 @@ def list_styles() -> list:
 
 
 def load_style(name: str):
-    f = HOME / "Styles" / f"{name}.json"
+    f = STYLES / f"{name}.json"
     return json.loads(f.read_text("utf-8")) if f.exists() else None
 
 
@@ -311,7 +311,7 @@ def director_plan(analyses, transcripts, settings) -> dict:
 
 
 def log_spend(usd):
-    f = HOME / "Projects" / "director_spend.json"
+    f = WORK / "director_spend.json"
     month = time.strftime("%Y-%m")
     data = json.loads(f.read_text()) if f.exists() else {}
     data[month] = round(data.get(month, 0) + usd, 4)
@@ -319,15 +319,15 @@ def log_spend(usd):
 
 
 def month_spend():
-    f = HOME / "Projects" / "director_spend.json"
+    f = WORK / "director_spend.json"
     return json.loads(f.read_text()).get(time.strftime("%Y-%m"), 0) if f.exists() else 0
 
 
 # ------------------------------------------------------------------ taste learning storage
 def load_taste():
-    f = HOME / "Projects" / "taste.json"
+    f = WORK / "taste.json"
     return json.loads(f.read_text()) if f.exists() else {}
 
 
 def save_taste(t):
-    (HOME / "Projects" / "taste.json").write_text(json.dumps(t))
+    (WORK / "taste.json").write_text(json.dumps(t))
