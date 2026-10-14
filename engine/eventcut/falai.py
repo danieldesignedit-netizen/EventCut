@@ -64,6 +64,8 @@ def _req(method, url, key, body=None, timeout=120):
             raise FalError("fal rejected the API key. Check it in Settings.")
         if e.code == 402 or "balance" in str(msg).lower() or "credit" in str(msg).lower():
             raise FalError("The fal account is out of credit. Top it up at fal.ai, or EventCut will listen on this PC.")
+        if e.code == 422 and "data url" in str(msg).lower():
+            raise FalError(f"fal error (422): fal couldn't read the sound in this format ({str(msg)[:80]})")
         raise FalError(f"fal error ({e.code}): {str(msg)[:200]}")
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
         raise FalError(f"Couldn't reach fal. Check the internet connection. ({getattr(e, 'reason', e)})")
@@ -85,13 +87,22 @@ def _req_retry(method, url, key, body=None, timeout=120, max_wait=180, note=None
             delay = min(30.0, delay * 1.6)
 
 
-def _audio_mp3(path):
-    """Mono 16 kHz AAC (M4A) of the clip's sound: about 0.25 MB per minute. (AAC is built into every FFmpeg.)"""
+# How the sound is sent to fal, best first. fal reads a data URL by its type, so the type must be one it knows
+# (an MP3 sent as audio/mpeg is the safest); the first that fal accepts is remembered.
+FORMATS = [("mp3", "audio/mpeg", ["-c:a", "libmp3lame", "-b:a", "32k"]),
+           ("wav", "audio/x-wav", ["-c:a", "pcm_s16le"]),
+           ("m4a", "audio/mp4", ["-c:a", "aac", "-b:a", "32k"])]
+_fmt = {"ok": None}
+
+
+def _audio(path, fmt):
+    """Mono 16 kHz sound of the clip in one of FORMATS (MP3: about 0.25 MB per minute)."""
     ff, _ = media.tools()
-    fd, tmp = tempfile.mkstemp(suffix=".m4a")
+    ext, _, codec = fmt
+    fd, tmp = tempfile.mkstemp(suffix="." + ext)
     os.close(fd)
     try:
-        media.run([ff, "-y", "-v", "error", "-i", path, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "aac", "-b:a", "32k", tmp])
+        media.run([ff, "-y", "-v", "error", "-i", path, "-vn", "-ac", "1", "-ar", "16000"] + codec + [tmp])
         with open(tmp, "rb") as f:
             return f.read()
     finally:
@@ -99,6 +110,20 @@ def _audio_mp3(path):
             os.remove(tmp)
         except OSError:
             pass
+
+
+def _formats():
+    fs = [f for f in FORMATS if f[0] != "mp3" or media.has_encoder("libmp3lame")]
+    if _fmt["ok"]:
+        fs = [f for f in fs if f[0] == _fmt["ok"]] + [f for f in fs if f[0] != _fmt["ok"]]
+    return fs
+
+
+def media_seconds(path):
+    try:
+        return float(media.probe(str(path)).get("duration") or 0)
+    except Exception:
+        return 0.0
 
 
 def log_usage(seconds):
@@ -128,19 +153,33 @@ def transcribe(path, prompt="", progress=None, cancelled=None):
     note = (lambda n: progress(0.0, n)) if progress else None
     if progress:
         progress(0.02, "Taking out the sound")
-    audio = _audio_mp3(path)
-    if len(audio) > MAX_BYTES:
-        raise FalError("This recording is too long to send in one piece.")
-    if len(audio) < 2000:
-        return []
-    secs = len(audio) / 4000.0  # 32 kbit/s
-    body = {"audio_url": "data:audio/mp4;base64," + base64.b64encode(audio).decode(), "task": "transcribe",
-            "language": "en", "chunk_level": "word", "batch_size": 64}
-    if prompt:
-        body["prompt"] = prompt
-    if progress:
-        progress(0.1, "Sending the sound to fal")
-    sub = _req_retry("POST", f"{API}/{MODEL}", c["key"], body, timeout=300, note=note)
+    sub, last, secs = None, None, 0.0
+    for fmt in _formats():
+        audio = _audio(path, fmt)
+        if fmt[0] == "wav" and len(audio) > 20 * 1024 * 1024:
+            continue  # too big to send this way
+        if len(audio) > MAX_BYTES:
+            raise FalError("This recording is too long to send in one piece.")
+        if len(audio) < 2000:
+            return []
+        secs = media_seconds(path)
+        body = {"audio_url": f"data:{fmt[1]};base64," + base64.b64encode(audio).decode(), "task": "transcribe",
+                "language": "en", "chunk_level": "word", "batch_size": 64}
+        if prompt:
+            body["prompt"] = prompt
+        if progress:
+            progress(0.1, "Sending the sound to fal")
+        try:
+            sub = _req_retry("POST", f"{API}/{MODEL}", c["key"], body, timeout=300, note=note)
+            _fmt["ok"] = fmt[0]
+            break
+        except FalError as e:
+            last = e
+            if "(422)" not in str(e) and "data url" not in str(e).lower() and "format" not in str(e).lower():
+                raise
+            print(f"fal refused the sound as {fmt[0]}: {e}")
+    if sub is None:
+        raise last or FalError("fal couldn't take the sound in any format.")
     status_url = sub.get("status_url") or f"{API}/{MODEL}/requests/{sub['request_id']}/status"
     result_url = sub.get("response_url") or f"{API}/{MODEL}/requests/{sub['request_id']}"
     t0 = time.time()

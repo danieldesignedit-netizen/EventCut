@@ -60,7 +60,7 @@ def scan(paths):
     return found, skipped
 
 
-@lru_cache(maxsize=512)
+@lru_cache(maxsize=4096)
 def probe(path: str) -> dict:
     _, ffprobe = tools()
     p = run([ffprobe, "-v", "error", "-print_format", "json", "-show_format", "-show_streams", path])

@@ -208,10 +208,14 @@ class Renderer:
         ai = (self.s.get("ai_colour") or {}).get(src)  # the Google AI colourist's notes for this clip
         if ai:
             ai = {k: v for k, v in ai.items() if k != "note"}
+        camera = None
+        if self.s.get("camera_match", True) and self.plan.get("cameras"):
+            from . import cameras
+            camera = cameras.match_for(self.plan["cameras"], src, float(self.s.get("camera_match_strength", 0.8)))
         return grade.lut_for(log_profile=profile, correction=corr, preset_name=self.s.get("preset", "Vibrant Cinematic"),
                              intensity=float(self.s.get("intensity", 1.0)), transfer=transfer,
                              theme_hex=self.primary if self.s.get("theme_tint") else None,
-                             custom_cube=custom if custom and Path(custom).exists() else None, ai=ai or None)
+                             custom_cube=custom if custom and Path(custom).exists() else None, ai=ai or None, camera=camera)
 
     def _source_lab_stats(self, src):
         import cv2
@@ -237,6 +241,14 @@ class Renderer:
         can quietly drop frames on some files). A short shot is re-made on the processor; if a little is still
         missing the last picture is held for those frames; if much is missing, it counts as a failed shot."""
         need = shot["length"] + extra_tail
+        # a shot that would run past the end of its clip (the transition needs a little extra picture) starts a moment
+        # earlier instead, so it never comes out short and is never mistaken for a damaged file
+        if shot.get("kind") != "photo" and not shot.get("soundbite"):
+            dur = float((self.an.get(shot["src"], {}).get("info") or {}).get("duration") or 0)
+            if dur and shot["in"] + need > dur - 0.08 and dur - need - 0.08 >= 0:
+                shift = shot["in"] - (dur - need - 0.08)
+                shot["in"] = round(shot["in"] - shift, 3)
+                shot["out"] = round(shot["in"] + shot["length"], 3)
         out = self.render_shot(i, shot, extra_tail)
         got = media.video_length(str(out), self.fps)
         if got >= need - 1.5 / self.fps:

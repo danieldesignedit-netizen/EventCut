@@ -128,21 +128,40 @@ def cues(plan: dict, amount: str = "normal") -> list:
     return clean
 
 
-def _pick_epidemic_sfx(kind, rng, recent, ideas):
-    """A fresh Epidemic effect for this kind: Google AI's ideas first when they match the kind."""
+def _pick_epidemic_sfx(kind, rng, recent, ideas, n=1):
+    """Up to n different, fresh Epidemic effects of this kind (Google AI's ideas first when they match the kind).
+    Several are taken from each search, so a video with ten transitions still needs only a search or two."""
     words = {"whoosh": ("whoosh", "swoosh", "swish", "swipe", "transition"), "riser": ("riser", "rise", "build", "uplift"),
              "impact": ("impact", "hit", "boom", "drop", "punch"), "sting": ("sting", "ending", "logo")}[kind]
     terms = [x for x in ideas if any(w in x.lower() for w in words)] + list(SFX_TERMS[kind])
     lo, hi = SFX_LEN[kind]
-    for term in terms[:4]:
-        items = epidemic.sfx_search(term, limit=30)
-        ok = [x for x in items if (lo <= x["length"] <= hi or not x["length"]) and f"esfx:{x['id']}" not in recent]
+    picked, seen = [], set(recent)
+    for term, page in [(t, 0) for t in terms[:6]] + [(t, 40) for t in terms[:3]]:  # a second page only when the first ran out
+        if len(picked) >= n:
+            break
+        items = epidemic.sfx_search(term, limit=40, offset=page)
+        ok = [x for x in items if (lo <= x["length"] <= hi or not x["length"]) and f"esfx:{x['id']}" not in seen]
         if not ok:
             continue
-        x = ok[int(rng.integers(0, min(len(ok), 12)))]
-        path = epidemic.sfx_download(x["id"], x["title"])
-        return {"path": path, "title": x["title"], "id": x["id"], "source": "Epidemic Sound"}
-    return None
+        order = list(rng.permutation(len(ok)))
+        for i in order[: n - len(picked)]:
+            x = ok[int(i)]
+            seen.add(f"esfx:{x['id']}")
+            picked.append(x)
+    out = []
+    if picked:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def dl(x):
+            try:
+                return {"path": epidemic.sfx_download(x["id"], x["title"]), "title": x["title"], "id": x["id"], "source": "Epidemic Sound"}
+            except epidemic.EpidemicError:
+                if len(picked) == 1:
+                    raise
+                return None
+        with ThreadPoolExecutor(6) as pool:
+            out = [r for r in pool.map(dl, picked) if r]
+    return out
 
 
 def build(plan: dict, settings: dict, music: dict, total: float, rng=None, notices=None) -> dict:
@@ -160,24 +179,23 @@ def build(plan: dict, settings: dict, music: dict, total: float, rng=None, notic
     for kind in ("whoosh", "riser", "impact", "sting"):
         if not any(c["kind"] == kind for c in cs):
             continue
-        n_variants = 2 if kind == "whoosh" and sum(1 for c in cs if c["kind"] == "whoosh") > 3 else 1
+        # a different effect at every cue: fresh Epidemic effects first, EventCut's own to fill any gap, and only then a repeat
+        n_need = sum(1 for c in cs if c["kind"] == kind)
         files = []
-        for _ in range(n_variants):
-            got = None
-            if epi_ok:
-                try:
-                    got = _pick_epidemic_sfx(kind, rng, recent | set(used_ids), ideas)
-                except epidemic.EpidemicError as e:
-                    epi_ok, epi_err = False, str(e)
-            if got:
-                used_ids.append(f"esfx:{got['id']}")
-                files.append(got)
-        if not files:  # EventCut's own effects as the fallback
+        if epi_ok:
+            try:
+                files = _pick_epidemic_sfx(kind, rng, recent | set(used_ids), ideas, n_need)
+            except epidemic.EpidemicError as e:
+                epi_ok, epi_err = False, str(e)
+        used_ids += [f"esfx:{f['id']}" for f in files]
+        if len(files) < n_need:
             fam = {"sting": "impact"}.get(kind, kind)
-            opts = builtin.get(fam) or builtin.get("whoosh") or []
-            if opts:
-                p = str(opts[int(rng.integers(0, len(opts)))])
+            opts = [str(o) for o in (builtin.get(fam) or builtin.get("whoosh") or [])]
+            for i in rng.permutation(len(opts))[: n_need - len(files)] if opts else []:
+                p = opts[int(i)]
                 files.append({"path": p, "title": Path(p).stem, "id": None, "source": source_of(p)})
+        if files:
+            files = [files[int(i)] for i in rng.permutation(len(files))]  # Epidemic and built-in effects mixed through the video
         chosen[kind] = files
     if want_sfx and settings.get("_epidemic_expected") and epi_err:
         notices.append(f"Epidemic Sound sound effects weren't used: {epi_err.rstrip('.')}. EventCut used its own effects instead.")

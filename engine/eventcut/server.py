@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import epidemic, falai, analyze, audio, gemini, grade, media, render, smart, story
+from . import cameras, epidemic, falai, analyze, audio, gemini, grade, media, render, smart, story
 from .config import (FINISHED, FONTS, HOME, LOGOS, LOGS, LOOKS, MUSIC_UPLOADS, PORT, VERSION, WORK, ensure_folders,
                      load_settings, save_settings)
 
@@ -285,14 +285,31 @@ def feed_copy(src):
         thumb = Path(src[:-4] + "_thumbnail.jpg")
         media.run([ff, "-y", "-v", "error"] + (["-i", str(thumb)] if thumb.exists() else ["-ss", f"{min(1.5, dur / 3):.2f}", "-i", src])
                   + ["-frames:v", "1", "-vf", scale, "-q:v", "3", str(img)])
+    # two lighter copies: a short silent loop for hovering on the homepage, and a 480p copy for slow connections
+    prev, small = folder / f"{key}_preview.mp4", folder / f"{key}_480.mp4"
+    side = lambda n: (f"scale=-2:{n}" if h >= w else f"scale={n}:-2") + ":flags=bicubic"
+    extra = {}
+    try:
+        if not prev.exists():
+            media.run([ff, "-y", "-v", "error", "-i", src, "-t", f"{min(12.0, dur):.2f}", "-vf", f"{side(540)},fps=25,format=yuv420p",
+                       "-an", "-c:v", "libx264", "-preset", "slow", "-crf", "28", "-maxrate", "700k", "-bufsize", "1400k",
+                       "-movflags", "+faststart", str(prev)])
+        extra["preview"] = str(prev)
+        if not small.exists():
+            media.run([ff, "-y", "-v", "error", "-i", src, "-t", f"{dur:.2f}", "-vf", f"{side(854)},fps=25,format=yuv420p",
+                       "-c:v", "libx264", "-preset", "slow", "-crf", "26", "-maxrate", "800k", "-bufsize", "1600k",
+                       "-c:a", "aac", "-b:a", "64k", "-ac", "2", "-movflags", "+faststart", str(small)])
+        extra["small"] = str(small)
+    except Exception as e:
+        log(f"homepage small copies failed for {Path(src).name}: {str(e).splitlines()[-1][:160]}")
     return {"video": str(vid), "poster": str(img), "seconds": round(dur, 1), "width": w, "height": h,
-            "bytes": vid.stat().st_size}
+            "bytes": vid.stat().st_size, **extra}
 
 
 WIDE_CROP = "scale=960:540:force_original_aspect_ratio=increase,crop=960:540:(iw-960)/2:(ih-540)*0.3"  # same frame, any source shape
 
 
-def grade_frame(p, t, preset, intensity=1.0, log_profile=None, width=960, wide=False):
+def grade_frame(p, t, preset, intensity=1.0, log_profile=None, width=960, wide=False, camera=None):
     """One frame of a source clip with the full colour pipeline (correction + look). Cached as a JPG."""
     ff, _ = media.tools()
     key = analyze.cache_key(p)
@@ -301,8 +318,8 @@ def grade_frame(p, t, preset, intensity=1.0, log_profile=None, width=960, wide=F
     log = a.get("log") or {}
     lut = grade.lut_for(log_profile=log_profile or (log.get("profile") if log.get("is_log") else None),
                         correction=grade.correction_params(a.get("frames", [])) if a.get("frames") else None,
-                        preset_name=preset, intensity=float(intensity), transfer=None, theme_hex=None)
-    tag = json.dumps([p, round(t, 2), preset, round(float(intensity), 2), log_profile, width, wide])
+                        preset_name=preset, intensity=float(intensity), transfer=None, theme_hex=None, camera=camera)
+    tag = json.dumps([p, round(t, 2), preset, round(float(intensity), 2), log_profile, width, wide, camera])
     out = WORK / "_thumbs" / f"grade_{hashlib.sha1(tag.encode()).hexdigest()[:12]}.jpg"
     out.parent.mkdir(parents=True, exist_ok=True)
     if not out.exists():
@@ -322,16 +339,18 @@ def raw_frame(p, t, width=960, wide=False):
     return out
 
 
-def ai_colour_pass(analyses, s, job=None, notices=None):
+def ai_colour_pass(analyses, s, job=None, notices=None, limit_s=None, tick=None):
     """Ask the Google AI colourist about one representative, corrected frame per clip (in parallel)."""
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
     ff, _ = media.tools()
     look = s.get("preset", "Vibrant Cinematic")
     vids = [a for a in analyses if a.get("kind") == "video" and a.get("moments")]
     offline = {"yes": False}  # no internet: one clip finds out, the rest skip straight away
 
+    t_end = time.time() + limit_s if limit_s else None
+
     def one(a):
-        if offline["yes"] or (job and job.cancelled):
+        if offline["yes"] or (job and job.cancelled) or (t_end and time.time() > t_end):
             raise gemini.AIError("skipped")
         if job:
             gemini._wait_note.fn = lambda note: job.update(done / max(1, len(vids)), note)
@@ -350,10 +369,16 @@ def ai_colour_pass(analyses, s, job=None, notices=None):
                        "-frames:v", "1", "-q:v", "4", str(jpg)])
         return a["path"], gemini.colourist(jpg, look, s.get("event_type", ""), analyze.proxy_key(a["path"]))
     out, done = {}, 0
-    with ThreadPoolExecutor(8) as pool:
-        for fut in [pool.submit(one, a) for a in vids]:
+    pool = ThreadPoolExecutor(8)
+    try:
+        futs = [pool.submit(one, a) for a in vids]
+        for fut in futs:
             try:
-                p, params = fut.result()
+                # past the time limit, clips still waiting on Google keep the standard correction (never hold up the video)
+                left = (t_end - time.time() + 5) if t_end else None
+                if left is not None and left <= 0 and not fut.done():
+                    raise gemini.AIError("skipped")
+                p, params = fut.result(timeout=left)
                 out[p] = params
             except gemini.AIError as e:
                 # anything but a one-off hiccup stops the colourist for every clip at once (no minutes of failing clip by clip)
@@ -364,11 +389,19 @@ def ai_colour_pass(analyses, s, job=None, notices=None):
                         log(f"colourist stopped: {e}")
                     offline["yes"] = True
                 # this clip keeps the standard correction
+            except FutTimeout:
+                pass
             except Exception:
                 traceback.print_exc()
             done += 1
+            if tick:
+                tick(done, len(vids))
             if job:
                 job.update(done / max(1, len(vids)), f"Clip {done} of {len(vids)}")
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    if t_end and len(out) < len(vids) and not offline["yes"]:
+        log(f"colourist: time limit reached, {len(out)} of {len(vids)} clips graded by Google AI")
     return out
 
 
@@ -433,6 +466,8 @@ def run_generate(job: Job):
         if not items:
             raise ValueError("No footage was chosen for this video. Choose the files (or open the video again from Your videos and use Regenerate).")
         gemini.take_switch_notes()
+        gemini.RUN_COST.update(usd=0.0, reused=0, calls=0)
+        gemini.DEAD.update(until=0, why="")  # an empty balance stops Google for one run only: a top-up works on the next video
         log(f"[{job.id}] new video: {len(items)} files, {s.get('duration')} s, {s.get('formats')}, direction: {(s.get('prompt') or '(none)')[:200]}")
         items = [m for m in items if readable(m)]
         vids = [m for m in items if m["kind"] in ("video", "photo")]
@@ -578,8 +613,7 @@ def run_generate(job: Job):
                         log(f"Google AI ({r.get('model')}): {len(picks)} moments, {len(r.get('statements', []))} statements, "
                             f"{r.get('parts_done')}/{r.get('parts')} parts in {r.get('seconds')} s")
                         if r.get("partial"):
-                            notices.append(f"Google AI watched only part of the footage ({r.get('partial_reason')}). "
-                                           "EventCut chose moments for the rest itself.")
+                            notices.append(f"{r.get('partial_reason')}, so EventCut chose those moments itself.")
                     except InterruptedError:
                         raise
                     except gemini.AIError as e:
@@ -817,16 +851,53 @@ def run_generate(job: Job):
                 analyses = [newer.get(a["path"], a) for a in analyses] + [a for pth, a in newer.items()
                                                                            if pth not in {x["path"] for x in analyses}]
                 plan = story.plan_edit(analyses, s, grid, transcripts, taste)
+        # Google AI colourist: gentle, per-clip corrections before the look, only for clips in the edit. It runs at the
+        # same time as the listening below (both mostly wait on the internet), so it adds almost no time.
+        colour_thread = None
+        if gemini.cfg()["key"] and gemini.enabled() and load_settings().get("google_colour", True) and s.get("preset") != "None":
+            used_c = {sh["src"] for sh in plan.get("shots", [])}
+            colour_box = {}
+
+            def colour_bg():
+                try:
+                    colour_box["out"] = ai_colour_pass([a for a in analyses if a["path"] in used_c], s, None, notices, limit_s=100,
+                                                      tick=lambda d, n: colour_box.update(done=d, n=n))
+                except Exception:
+                    traceback.print_exc()
+            colour_thread = threading.Thread(target=colour_bg, daemon=True)
+            colour_thread.start()
+        # camera matching: every camera's colours are measured (from the small skim copies) and matched to the main camera
+        cam_thread = None
+        if s.get("preset") != "None" and s.get("camera_match", load_settings().get("camera_match", True)):
+            cam_box = {}
+
+            def cams_bg():
+                try:
+                    cam_box["out"] = cameras.measure(analyses, s.get("_skim"), hero=s.get("hero_camera") or load_settings().get("hero_camera"))
+                except Exception:
+                    traceback.print_exc()
+            cam_thread = threading.Thread(target=cams_bg, daemon=True)
+            cam_thread.start()
         if want_words and skim:  # fast watching: listen only to the clips that made it into the video
             used = {sh["src"] for sh in plan.get("shots", [])}
             pool = [a for a in analyses if a["path"] in used]
             listen_to(pool, sum(float(a["info"].get("duration") or 0) for a in pool))
         s.pop("_ai", None)
-        # Google AI colourist: gentle, per-clip corrections before the look, only for clips in the edit
-        if gemini.cfg()["key"] and load_settings().get("google_colour", True) and s.get("preset") != "None":
+        if colour_thread:
             job.set_stage("colour", "Google AI is grading each clip")
-            used = {sh["src"] for sh in plan.get("shots", [])}
-            s["ai_colour"] = ai_colour_pass([a for a in analyses if a["path"] in used], s, job, notices)
+            while colour_thread.is_alive():
+                if job.cancelled:
+                    raise InterruptedError
+                colour_thread.join(0.5)
+                job.update(min(.95, colour_box.get("done", 0) / max(1, colour_box.get("n", 1))), "Fine-tuning the colour of each clip")
+            s["ai_colour"] = colour_box.get("out") or {}
+        if cam_thread:
+            cam_thread.join(60)
+            cams = cam_box.get("out") or {}
+            if len([c for c in cams.get("cameras", []) if c.get("stats")]) > 1:
+                plan["cameras"] = cams
+                hero = next(c["label"] for c in cams["cameras"] if c["key"] == cams["hero"])
+                log(f"[{job.id}] camera match: {len(cams['cameras'])} cameras, matched to {hero}")
         if ai:
             plan["ai"] = {"used": True, "cost_usd": round(sum(v.get("usd", 0) for v in ai.values()), 4)}
         if ai_note:
@@ -840,6 +911,8 @@ def run_generate(job: Job):
             from . import soundplan
             s["_epidemic_expected"] = epidemic.enabled()
             s["sound"] = soundplan.build(plan, s, music, dur, np.random.default_rng((int(s.get("seed", 0)) * 7 + 3) % (2 ** 32)), notices)
+        plan["google"] = {"usd": round(gemini.RUN_COST["usd"], 4), "reused": gemini.RUN_COST["reused"], "calls": gemini.RUN_COST["calls"],
+                          "model": gemini.USED.get("model")}
         for n_ in gemini.take_switch_notes():
             if n_ not in notices:
                 notices.insert(0, n_)
@@ -870,6 +943,14 @@ def run_generate(job: Job):
                 else:
                     job.update(min(1, order.get(stage, 0) + frac * 0.2), note)
             r = render.Renderer(plan, fs, analyses, fdir, prog, lambda: job.cancelled).run(transcripts if s.get("captions") else None)
+            try:  # the editable Premiere Pro sequence, next to the video
+                from . import premiere
+                if r.get("video"):
+                    r["premiere"] = premiere.build(plan, s.get("sound") or {}, fs, {a["path"]: a for a in analyses}, r["video"],
+                                                   Path(r["video"]).with_name(Path(r["video"]).stem + " - Premiere.xml"),
+                                                   r.get("width") or 1080, r.get("height") or 1920, int(fs.get("fps", 25)))
+            except Exception as e:
+                log(f"[{job.id}] Premiere export failed: {e}")
             update_speed("render", (time.time() - t0) * 0.75 / dur)
             update_speed("finish", (time.time() - t0) * 0.25 / dur)
             results.append(r)
@@ -982,7 +1063,15 @@ def run_remix(job: Job):
                 t += sh["length"]
             mix = r.mix_audio(body, total, trans_at)
             job.set_stage("export", "Exporting")
-            outs.append(r.export(video, mix))
+            ro = r.export(video, mix)
+            try:  # the Premiere sequence gets the new music and effects too
+                from . import premiere
+                ro["premiere"] = premiere.build(meta["plan"], s.get("sound") or {}, fs, {}, ro["video"],
+                                                Path(ro["video"]).with_name(Path(ro["video"]).stem + " - Premiere.xml"),
+                                                ro.get("width") or 1080, ro.get("height") or 1920, int(fs.get("fps", 25)))
+            except Exception as e:
+                log(f"Premiere export failed: {e}")
+            outs.append(ro)
         meta["settings"].update(p.get("settings") or {})
         meta["outputs"] = outs
         (folder / "project.json").write_text(json.dumps(meta, indent=1), "utf-8")
@@ -1021,7 +1110,10 @@ def run_recaption(job: Job):
                 (fdir / "captions.json").write_text(json.dumps(words), "utf-8")
             video = r.finish_video(body, end, caps)
             mix = r.work / "mix.wav"
-            outs.append(r.export(video, mix))
+            ro = r.export(video, mix)
+            if o.get("premiere"):
+                ro["premiere"] = o["premiere"]
+            outs.append(ro)
         # remember the corrections, so the next version of a video from this footage spells it right
         fixes = {}
         for w in words:
@@ -1291,7 +1383,8 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     info = media.probe(m["path"]) if m["kind"] != "photo" else {}
                     m.update({"duration": info.get("duration", 0), "width": info.get("width"), "height": info.get("height"),
-                              "fps": info.get("fps"), "hdr": media.is_hdr(info) if info else False})
+                              "fps": info.get("fps"), "hdr": media.is_hdr(info) if info else False,
+                              "camera": cameras.camera_key({"path": m["path"], "info": info, "kind": m["kind"]})})
                     out.append(m)
                 except Exception:
                     skipped.append({"path": m["path"], "reason": "This file is damaged or can't be read, so it was skipped."})
@@ -1347,6 +1440,30 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"path": str(out), "start": 0})
         if path == "/thumb":
             return self.thumb(q.get("path", [""])[0], float(q.get("t", ["1"])[0]), int(q.get("w", ["480"])[0]))
+        if path == "/cameras" and method == "POST":
+            # the cameras in this project and which one the others are matched to (for the colour step)
+            b = self.body()
+            items = []
+            for p in [p for p in (b.get("paths") or []) if path_allowed(p) and os.path.isfile(p)][:2000]:
+                aj = analyze.CACHE / f"{analyze.cache_key(p)}.json"
+                a = None
+                if aj.exists():
+                    try:
+                        a = json.loads(aj.read_text("utf-8"))
+                    except Exception:
+                        a = None
+                if not a:
+                    kind = media.classify(Path(p))
+                    try:
+                        a = {"path": p, "kind": kind, "info": media.probe(p) if kind == "video" else {}}
+                    except Exception:
+                        continue
+                items.append(a)
+            cams = cameras.measure(items, per_camera=4, hero=b.get("hero") or load_settings().get("hero_camera"))
+            out = cameras.summary(cams)
+            for c in out:
+                c["match"] = cameras.match_for(cams, c["sample"]) if c.get("sample") else None
+            return self.send_json({"cameras": out, "hero": cams.get("hero"), "auto_hero": cams.get("auto_hero")})
         if path == "/grade-preview" and method == "POST":
             return self.grade_preview(self.body())
         if path == "/library/search":
@@ -1565,7 +1682,7 @@ class Handler(BaseHTTPRequestHandler):
                 for k in ("notify_sound", "notify_volume", "director_mode_api_key", "director_monthly_cap_usd", "director_mode_model",
                           "google_api_key", "google_model", "google_monthly_cap_usd", "use_google_ai", "google_prices", "speech_language",
                           "google_colour", "max_parallel_jobs", "fal_api_key", "use_fal", "analyse_workers",
-                          "epidemic_api_key", "use_epidemic", "epidemic_auto"):
+                          "epidemic_api_key", "use_epidemic", "epidemic_auto", "camera_match", "hero_camera"):
                     if k in b:
                         cfg[k] = b[k]
                 save_settings(cfg)
@@ -1579,6 +1696,7 @@ class Handler(BaseHTTPRequestHandler):
             safe["director_key_set"] = bool(cfg.get("director_mode_api_key"))
             safe["google_key_set"] = bool(cfg.get("google_api_key"))
             safe["google_month_spend"] = round(gemini.month_spend(), 3)
+            safe["google_model_used"] = gemini.pretty(gemini.USED["model"]) if gemini.USED.get("model") else ""
             safe["google_prices"] = {**gemini.DEFAULT_PRICES, **(cfg.get("google_prices") or {})}
             return self.send_json(safe)
         if path == "/brand-kit" and method == "POST":
@@ -1719,7 +1837,8 @@ class Handler(BaseHTTPRequestHandler):
         out, last = None, None
         for tt in (t, 1.0, 0.0):  # a damaged or unreadable spot: try the start of the clip instead
             try:
-                out = grade_frame(p, tt, b.get("preset", "Vibrant Cinematic"), float(b.get("intensity", 1)), b.get("log_profile"))
+                out = grade_frame(p, tt, b.get("preset", "Vibrant Cinematic"), float(b.get("intensity", 1)), b.get("log_profile"),
+                                  camera=b.get("camera") if isinstance(b.get("camera"), dict) else None)
                 if out.exists() and out.stat().st_size > 0:
                     break
             except Exception as e:

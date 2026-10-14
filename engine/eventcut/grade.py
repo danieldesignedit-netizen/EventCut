@@ -320,6 +320,18 @@ def apply_transfer(x, src_stats, ref_stats, strength=0.7):
     return clamp(x * (1 - strength) + _lab2rgb(out) * strength)
 
 
+def apply_camera_match(x, src_stats, ref_stats, strength=0.7):
+    """Make one camera's colours sit with the main ("hero") camera's: a gentle LAB match with limits, so a camera that
+    happened to film a green pitch while the hero filmed a stage isn't pushed to a strange colour."""
+    lab = _rgb2lab(x)
+    sm, ss = np.array(src_stats["mean"]), np.array(src_stats["std"])
+    rm, rs = np.array(ref_stats["mean"]), np.array(ref_stats["std"])
+    ratio = np.clip(rs / np.maximum(ss, 1e-3), 0.8, 1.25)        # contrast and saturation
+    shift = np.clip(rm - sm, [-8, -7, -7], [8, 7, 7])             # brightness, then tint (green-magenta, blue-yellow)
+    out = (lab - sm) * ratio + sm + shift
+    return clamp(x * (1 - strength) + _lab2rgb(out) * strength)
+
+
 # ------------------------------------------------------------------ hex theme tint
 def hex_to_rgb(h):
     h = h.strip().lstrip("#")
@@ -337,7 +349,7 @@ def theme_tint(x, hex_color, amount=0.06):
 
 # ------------------------------------------------------------------ build + write
 def build_lut(log_profile=None, correction=None, preset_name="Vibrant Cinematic", intensity=1.0,
-              transfer=None, theme_hex=None, custom_cube=None, ai=None):
+              transfer=None, theme_hex=None, custom_cube=None, ai=None, camera=None):
     x = grid()
     x = decode_log(x, log_profile)
     if preset_name == "None":
@@ -347,6 +359,8 @@ def build_lut(log_profile=None, correction=None, preset_name="Vibrant Cinematic"
         x = apply_correction(x, correction)
     if ai:
         x = apply_ai(x, ai)
+    if camera:
+        x = apply_camera_match(x, camera["src"], camera["ref"], camera.get("strength", 0.7))
     if transfer:
         x = apply_transfer(x, transfer["src"], transfer["ref"], transfer.get("strength", 0.7))
     if custom_cube:

@@ -24,7 +24,7 @@ PROMPT_VERSION = "p4"
 # Tokens Google counts per second of video at low media resolution, one frame a second (70) plus sound (25).
 VIDEO_TOK_S, AUDIO_TOK_S = 70, 25
 # US$ per million tokens. Prices change: they can be edited in Settings (google_prices).
-DEFAULT_PRICES = {"flash": {"in": 0.30, "audio": 1.00, "out": 2.50}, "pro": {"in": 1.25, "audio": 1.25, "out": 10.00}}
+DEFAULT_PRICES = {"flash": {"in": 0.50, "audio": 1.00, "out": 3.00}, "pro": {"in": 2.00, "audio": 2.00, "out": 12.00}}
 
 
 class AIError(RuntimeError):
@@ -48,6 +48,9 @@ _wait_note = threading.local()  # set by the caller to show "waiting for interne
 NET_WAIT_MAX = 45 * 60  # keep waiting for a lost connection for up to 45 minutes
 # The current job (shared by all threads): its progress note, a time limit and a way to stop at once when cancelled.
 RUN = {"note": None, "deadline": None, "cancelled": None}
+
+
+DEAD = {"until": 0, "why": ""}  # set when the prepaid balance is empty: no more requests for a while
 
 
 def _stop_check():
@@ -103,6 +106,9 @@ def _req_once(method, url, key, body=None, headers=None, timeout=120, raw=False)
             pass
         if e.code in (401, 403) or "API key not valid" in msg:
             raise AIError("Google rejected the API key. Check it in Settings, and that the Gemini API is enabled for it.")
+        if e.code == 402 or "prepayment" in msg.lower() or "credits are depleted" in msg.lower() or "billing" in msg.lower() and e.code in (400, 403):
+            DEAD.update(until=time.time() + 1800, why="credit")
+            raise AIError("Your Google AI prepaid credit has run out. Top it up in Google AI Studio → Billing.")
         if e.code == 429:
             raise AIError("Google AI's usage limit was reached. Wait a minute, or turn on billing for the key to raise limits.")
         raise AIError(f"Google AI error ({e.code}): {msg[:300]}")
@@ -213,7 +219,10 @@ def take_switch_notes():
 def call_model(c, body, timeout=900, fallback_flash=True):
     """generateContent with the right model. If Google has closed a model, EventCut moves to the model Google
     names (or the newest one available), and from Pro to Flash if Pro can't be used; the change is reported."""
+    if DEAD["until"] > time.time():
+        raise AIError("Your Google AI prepaid credit has run out. Top it up in Google AI Studio → Billing.")
     tier = c["tier"]
+    body.setdefault("generationConfig", {}).setdefault("maxOutputTokens", 32768)  # room for the whole answer
     first = None
     for attempt in range(5):
         model = pick_model(c["key"], tier)
@@ -275,9 +284,35 @@ def month_spend():
         return 0.0
 
 
-def log_spend(usage, tier):
-    p = cfg()["prices"].get(tier, DEFAULT_PRICES["flash"])
+# US$ per million tokens by model (Google's published prices; a request over 200,000 tokens costs more on Pro).
+MODEL_PRICES = [
+    (r"gemini-3(\.\d+)?-pro", {"in": 2.00, "audio": 2.00, "out": 12.00, "in_long": 4.00, "out_long": 18.00}),
+    (r"gemini-2\.5-pro", {"in": 1.25, "audio": 1.25, "out": 10.00, "in_long": 2.50, "out_long": 15.00}),
+    (r"gemini-3\.5-flash", {"in": 1.50, "audio": 1.50, "out": 9.00}),
+    (r"gemini-3(\.\d+)?-flash", {"in": 0.50, "audio": 1.00, "out": 3.00}),
+    (r"gemini-2\.5-flash", {"in": 0.30, "audio": 1.00, "out": 2.50}),
+]
+RUN_COST = {"usd": 0.0, "reused": 0, "calls": 0}  # this video's Google cost (reset by the engine for each new video)
+_cost_lock = threading.Lock()
+
+
+def price_for(model, tier):
+    for pat, pr in MODEL_PRICES:
+        if model and re.match(pat, model):
+            return pr
+    return cfg()["prices"].get(tier, DEFAULT_PRICES["flash"])
+
+
+def note_reused():
+    with _cost_lock:
+        RUN_COST["reused"] += 1
+
+
+def log_spend(usage, tier, model=None):
+    p = price_for(model or USED.get("model"), tier)
     prompt = usage.get("promptTokenCount", 0)
+    if prompt > 200_000 and "in_long" in p:  # Google bills the whole request at the long-context rate
+        p = dict(p, **{"in": p["in_long"], "audio": p["in_long"], "out": p["out_long"]})
     audio_t = sum(d.get("tokenCount", 0) for d in usage.get("promptTokensDetails", []) if d.get("modality") == "AUDIO")
     out = usage.get("candidatesTokenCount", 0) + usage.get("thoughtsTokenCount", 0)
     usd = (prompt - audio_t) / 1e6 * p["in"] + audio_t / 1e6 * p["audio"] + out / 1e6 * p["out"]
@@ -289,6 +324,9 @@ def log_spend(usage, tier):
     m = time.strftime("%Y-%m")
     d[m] = round(d.get(m, 0) + usd, 4)
     spend_file().write_text(json.dumps(d))
+    with _cost_lock:
+        RUN_COST["usd"] += usd
+        RUN_COST["calls"] += 1
     return usd
 
 
@@ -405,14 +443,72 @@ def generate(c, file_uri, prompt, schema=True):
     return call_model(c, body, timeout=900)
 
 
-def _json_from(resp):
-    parts = (resp.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
+def _repair_json(text):
+    """A cut-off JSON answer: keep every complete item, close what is still open."""
+    stack, in_str, esc, last_ok = [], False, False, -1
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+            if stack and stack[-1] == "[":
+                last_ok = i  # an item inside a list has just finished
+            if not stack:
+                return json.loads(text[:i + 1])
+    if last_ok < 0:
+        raise ValueError("nothing complete")
+    head = text[:last_ok + 1]
+    # close whatever is still open at that point
+    st, in_s, es = [], False, False
+    for ch in head:
+        if in_s:
+            if es:
+                es = False
+            elif ch == "\\":
+                es = True
+            elif ch == '"':
+                in_s = False
+            continue
+        if ch == '"':
+            in_s = True
+        elif ch in "{[":
+            st.append(ch)
+        elif ch in "}]" and st:
+            st.pop()
+    return json.loads(head + "".join("]" if c == "[" else "}" for c in reversed(st)))
+
+
+def _json_from(resp, with_status=False):
+    """The JSON answer. with_status=True returns (data, complete): a cut-off answer is repaired, keeping every
+    complete item, and reported as incomplete."""
+    cand = (resp.get("candidates") or [{}])[0]
+    parts = cand.get("content", {}).get("parts", [])
     text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
     if not text:
-        reason = (resp.get("candidates") or [{}])[0].get("finishReason") or resp.get("promptFeedback", {}).get("blockReason")
+        reason = cand.get("finishReason") or resp.get("promptFeedback", {}).get("blockReason")
         raise AIError(f"Google AI returned nothing for this clip ({reason or 'no answer'}).")
-    text = text[text.index("{"): text.rindex("}") + 1] if "{" in text else text
-    return json.loads(text)
+    start = text.find("{")
+    body = text[start:] if start >= 0 else text
+    try:
+        data = json.loads(body[: body.rindex("}") + 1] if "}" in body else body)
+        complete = cand.get("finishReason") not in ("MAX_TOKENS",)
+    except ValueError:
+        try:
+            data, complete = _repair_json(body), False
+        except ValueError:
+            raise AIError("Google AI's answer was incomplete.")
+    return (data, complete) if with_status else data
 
 
 def analyse_clip(path, event_type, duration_s, key_for_cache, progress=None):
@@ -436,7 +532,7 @@ def analyse_clip(path, event_type, duration_s, key_for_cache, progress=None):
     f = upload(c["key"], copy, lambda x: say(0.1 + 0.3 * x, f"Sending to Google AI, {int(x * 100)}%"))
     say(0.45, "Google AI is watching and listening")
     resp, model, tier = generate(c, f["uri"], _prompt(event_type, duration_s))
-    usd = log_spend(resp.get("usageMetadata", {}), tier)
+    usd = log_spend(resp.get("usageMetadata", {}), tier, model)
     data = _json_from(resp)
     bites = []
     for b in data.get("bites", []):
@@ -458,6 +554,7 @@ def analyse_clip(path, event_type, duration_s, key_for_cache, progress=None):
 def test_key(key, tier=None):
     """Check from Settings and Check everything: a real, tiny request with exactly the model EventCut will use
     (a model can be listed but closed to new users; only a real request shows that). Returns the model used."""
+    DEAD.update(until=0, why="")  # a test always really asks Google
     c = dict(cfg(), key=key.strip(), tier=tier or cfg()["tier"])
     body = {"contents": [{"role": "user", "parts": [{"text": "Reply with the single word OK."}]}],
             "generationConfig": {"temperature": 0, "maxOutputTokens": 20}}
@@ -497,11 +594,12 @@ Be subtle. Most values should be between -0.3 and 0.3. Use 0 when unsure."""
 def colourist(frame_jpg, look, event_type, cache_tag):
     """Adjustments for one clip from one representative frame. Cached; a fraction of a cent per clip."""
     import base64
-    c = cfg()
+    c = dict(cfg(), tier="flash")  # colour is a simple job: Flash does it in about a second, whatever the main setting
     CACHE.mkdir(parents=True, exist_ok=True)
     tag = hashlib.sha1(f"{cache_tag}|{look}|{c['tier']}|{COLOUR_VERSION}".encode()).hexdigest()[:16]
     out = CACHE / f"colour_{tag}.json"
     if out.exists():
+        note_reused()
         return json.loads(out.read_text("utf-8"))
     if month_spend() >= c["cap"]:
         raise AIError("Google AI has reached this month's spending cap.")
@@ -511,7 +609,7 @@ def colourist(frame_jpg, look, event_type, cache_tag):
                                                      {"text": _colour_prompt(look, event_type)}]}],
             "generationConfig": {"temperature": 0.2, "response_mime_type": "application/json", "response_schema": COLOUR_SCHEMA}}
     resp, model, tier = call_model(c, body, timeout=120)
-    log_spend(resp.get("usageMetadata", {}), tier)
+    log_spend(resp.get("usageMetadata", {}), tier, model)
     d = _json_from(resp)
     lim = {"temperature": 1, "tint": 1, "exposure": 0.7, "contrast": 0.5, "highlights": 0.5, "shadows": 0.5, "saturation": 0.5}
     p = {k: round(max(-v, min(v, float(d.get(k, 0) or 0))), 3) for k, v in lim.items()}
@@ -539,7 +637,7 @@ def _images_request(images, text, schema):
     body = {"contents": [{"role": "user", "parts": parts}],
             "generationConfig": {"temperature": 0.1, "response_mime_type": "application/json", "response_schema": schema}}
     resp, model, tier = call_model(c, body, timeout=180)
-    log_spend(resp.get("usageMetadata", {}), tier)
+    log_spend(resp.get("usageMetadata", {}), tier, model)
     return _json_from(resp)
 
 
@@ -650,6 +748,10 @@ def why_not(e) -> str:
         return "Google's usage limit was reached (wait a few minutes, or turn on billing for the key)"
     if "Couldn't reach Google AI" in m:
         return "the internet connection to Google AI was lost"
+    if "prepaid credit" in m:
+        return "your Google AI prepaid credit has run out (top it up in Google AI Studio → Billing)"
+    if "incomplete" in m or "delimiter" in m or "Expecting" in m:
+        return "Google AI's answer came back incomplete"
     if "time allowed" in m:
         return "Google AI was too slow to answer in time (usually a slow upload), so EventCut didn't wait any longer"
     if "No Google AI model could be used" in m:
@@ -781,6 +883,7 @@ def pick_moments(clips, event_type, direction, duration, progress=None, chunk_s=
         cached = folder / f"{tag_of(k)}.json"
         if cached.exists():
             results[k] = json.loads(cached.read_text("utf-8"))
+            note_reused()
             state[k] = "done"
             say(_frac(), f"Google AI already watched part {k + 1} of {n} (saved)")
             return
@@ -811,16 +914,29 @@ def pick_moments(clips, event_type, direction, duration, progress=None, chunk_s=
             while not stop.wait(5):
                 show(k, f"Google AI is watching ({int(time.time() - t_w)} s)")
         threading.Thread(target=ticker, daemon=True).start()
+        spent = 0.0
         try:
-            resp, model, tier = generate_with(c, f["uri"], _pick_prompt(event_type, direction, duration, k + 1, n, int(t // 60)), PICK_SCHEMA)
+            data = None
+            for attempt in range(2):  # an answer that came back cut off is asked for once more
+                resp, model, tier = generate_with(c, f["uri"], _pick_prompt(event_type, direction, duration, k + 1, n, int(t // 60)), PICK_SCHEMA)
+                spent += log_spend(resp.get("usageMetadata", {}), tier, model)
+                try:
+                    got, complete = _json_from(resp, with_status=True)
+                except AIError:
+                    got, complete = None, False
+                if got is not None and (data is None or len(got.get("moments") or []) > len(data.get("moments") or [])):
+                    data = got
+                if complete:
+                    break
+                show(k, "Google AI's answer was cut off, asking again")
+            if data is None:
+                raise AIError(f"Google AI's answer for part {k + 1} of {n} was incomplete.")
         finally:
             stop.set()
             try:
                 _req("DELETE", f"{API}/v1beta/{f['name']}", c["key"], timeout=20)
             except Exception:
                 pass
-        spent = log_spend(resp.get("usageMetadata", {}), tier)
-        data = _json_from(resp)
 
         def where(s_, e_):
             mid = (s_ + e_) / 2
@@ -864,7 +980,7 @@ def pick_moments(clips, event_type, direction, duration, progress=None, chunk_s=
         except OSError:
             pass
 
-    errors = []
+    errors, failed = [], []
     ex = cf.ThreadPoolExecutor(3)
     futs = {ex.submit(one, k): k for k in range(n)}
     pending = set(futs)
@@ -880,9 +996,11 @@ def pick_moments(clips, event_type, direction, duration, progress=None, chunk_s=
                 except AIError as e:
                     state[k] = "failed"
                     errors.append(e)
+                    failed.append(k + 1)
                 except Exception as e:
                     state[k] = "failed"
                     errors.append(AIError(str(e).splitlines()[0][:200] if str(e) else type(e).__name__))
+                    failed.append(k + 1)
             if cancelled and cancelled():
                 raise InterruptedError
             if time.time() > RUN["deadline"] + 20:  # a stuck answer: carry on without it
@@ -907,7 +1025,17 @@ def pick_moments(clips, event_type, direction, duration, progress=None, chunk_s=
             "summaries": [r.get("summary", "") for r in ok], "model": next((r.get("model") for r in ok if r.get("model")), ""),
             "usd": round(sum(r.get("usd", 0) for r in ok if r.get("fresh")), 4), "partial": len(ok) < n,
             "parts": n, "parts_done": len(ok), "seconds": round(time.time() - t0, 1),
-            "partial_reason": why_not(errors[0]) if errors and len(ok) < n else ""}
+            "partial_reason": _partial_reason(errors, failed, n) if errors and len(ok) < n else ""}
+
+
+def _partial_reason(errors, failed, n):
+    """e.g. "Google AI's answer for part 2 of 6 was incomplete" (no technical text)."""
+    which = (f"part {failed[0]} of {n}" if len(failed) == 1 else
+             f"parts {', '.join(str(x) for x in sorted(failed)[:-1])} and {sorted(failed)[-1]} of {n}") if failed else "some parts"
+    m = str(errors[0])
+    if "incomplete" in m:
+        return f"Google AI's answer for {which} was incomplete"
+    return f"Google AI couldn't finish {which}: {why_not(errors[0])}"
 
 
 def generate_with(c, file_uri, prompt, schema):

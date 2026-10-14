@@ -62,6 +62,21 @@ def run(clip=None, use_downloads=False):
         return f"All EventCut folders work. {free:.0f} GB free in {HOME}."
     res.append(_check("EventCut folder", folders))
 
+    def keys_locked():
+        from . import config as cfgmod
+        import platform as _pf
+        probe_text = "eventcut-check-" + uuid.uuid4().hex[:8]
+        locked = cfgmod.lock_secret(probe_text)
+        if cfgmod.unlock_secret(locked) != probe_text:
+            return False, "Keys couldn't be locked to this PC. They still work, but stay readable in settings.json."
+        raw = cfgmod.SETTINGS_FILE.read_text("utf-8") if cfgmod.SETTINGS_FILE.exists() else ""
+        plain = [k for k in cfgmod.SECRET_KEYS if f'"{k}": "' in raw and f'"{k}": ""' not in raw and f'"{k}": "enc:' not in raw]
+        if plain:
+            return False, "Some keys are still readable in settings.json. Open Settings and save once to lock them."
+        who = "Windows account" if _pf.system() == "Windows" else "computer"
+        return f"Your keys are locked to this {who}: settings.json shows unreadable text, and a copy won't work on another PC."
+    res.append(_check("Keys locked to this PC", keys_locked))
+
     test_clip = clip if clip and os.path.isfile(clip) else None
 
     def decode():
