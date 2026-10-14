@@ -85,6 +85,8 @@ def _qscore(fr, loud):
     dark = np.mean([f["luma"] for f in fr]) < 0.07
     blurry = np.mean([f["sharp"] for f in fr]) < 18
     score = 0.34 * q + 0.22 * min(1, faces / 2) + 0.12 * min(1, area * 25) + 0.18 * peak + 0.08 * energy + 0.06 * min(1, motion * 4)
+    # action counts as much as faces: a wide shot of play (small, distant players) mustn't lose to a static close-up
+    score += 0.14 * min(1, motion * 4) * (1 - 0.5 * min(1, faces / 2))
     return score, bool(dark or blurry), max(energy, peak * 0.8), faces
 
 
@@ -181,21 +183,28 @@ def plan_windows(quicks: list, duration: float, ai_picks=None, order=None, boost
     if not cands:
         return chosen
     order = order or [q["path"] for q in quicks]
-    pos = {p: i for i, p in enumerate(order)}
+    # bins by footage time in the order things happened (not by clip count): a 90-minute match in three long clips
+    # gets as many close looks as 90 minutes of short phone clips
+    cum, t = {}, 0.0
+    for p in order:
+        if p in by_path:
+            cum[p] = t
+            t += float(by_path[p]["info"].get("duration") or 0)
+    total = max(1.0, t)
     bins = 12
-    per_bin = max(1, int(n_target * 0.5 / bins))
+    per_bin = max(1, int(n_target * 0.6 / bins))
     if boost > 1:
         per_bin *= 2
     by_bin = {}
     for sc, p, w in cands:
-        b = min(bins - 1, int(pos.get(p, 0) / max(1, len(order)) * bins))
+        b = min(bins - 1, int((cum.get(p, 0) + (w["start"] + w["end"]) / 2) / total * bins))
         by_bin.setdefault(b, []).append((sc, p, w))
     per_clip = {}
 
     def take(sc, p, w):
         q = by_path[p]
         dur = float(q["info"].get("duration") or 0)
-        limit = int((2 + int(dur // 60)) * boost)
+        limit = int((2 + int(dur // 45)) * boost)
         if per_clip.get(p, 0) >= limit:
             return False
         mid = (w["start"] + w["end"]) / 2

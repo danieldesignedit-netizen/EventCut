@@ -88,7 +88,16 @@ def _req(path, params=None, key=None, timeout=30, method="GET", body=None):
             raise EpidemicError("Your Epidemic Sound plan has no credit left for this.")
         if e.code == 429:
             raise EpidemicError("Epidemic Sound's limit was reached (too many requests or downloads). Try again later.")
-        raise EpidemicError(f"Epidemic Sound error ({e.code}). {msg}")
+        detail = ""
+        try:  # Epidemic's own explanation, in plain words, never the raw JSON
+            j = json.loads(msg)
+            errs = j.get("errors") or []
+            detail = "; ".join(" ".join(x.get("messages") or []) for x in errs if isinstance(x, dict)) or j.get("message") or ""
+        except Exception:
+            detail = re.sub(r"<[^>]+>", " ", msg).strip()
+        if e.code >= 500:
+            raise EpidemicError("Epidemic Sound was having problems on its side. Try again later.")
+        raise EpidemicError(f"Epidemic Sound refused the request ({e.code}{': ' + detail[:120] if detail else ''}).")
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
         raise EpidemicError(f"Couldn't reach Epidemic Sound. Check the internet connection. ({getattr(e, 'reason', e)})")
 
@@ -104,8 +113,15 @@ def _track(t):
             "downloaded": bool(_local(str(t.get("id"))))}
 
 
-def search(term="", limit=30, offset=0, instrumental=False, bpm_min=None, bpm_max=None, sort=None):
-    p = {"term": term or None, "limit": min(60, int(limit)), "offset": int(offset), "bpmMin": bpm_min, "bpmMax": bpm_max,
+PAGE = 40  # Epidemic only accepts result offsets of 0, 40, 80, ...
+
+
+def _page_offset(offset):
+    return (max(0, int(offset)) // PAGE) * PAGE
+
+
+def search(term="", limit=PAGE, offset=0, instrumental=False, bpm_min=None, bpm_max=None, sort=None):
+    p = {"term": term or None, "limit": min(60, int(limit)), "offset": _page_offset(offset), "bpmMin": bpm_min, "bpmMax": bpm_max,
          "sort": sort}
     if instrumental:
         p["vocalType"] = ["NONE", "PRESENCE"]
@@ -255,8 +271,8 @@ def _sfx_item(x):
             "downloaded": bool(_local_sfx(str(x.get("id"))))}
 
 
-def sfx_search(term, limit=30, offset=0):
-    d = _req("/v0/sound-effects/search", {"term": term[:500], "limit": min(60, int(limit)), "offset": int(offset),
+def sfx_search(term, limit=PAGE, offset=0):
+    d = _req("/v0/sound-effects/search", {"term": term[:500], "limit": min(60, int(limit)), "offset": _page_offset(offset),
                                            "sort": "best-match", "order": "desc"})
     items = d.get("soundEffects") or d.get("sound_effects") or d.get("tracks") or d.get("items") or d.get("data") or []
     return [_sfx_item(x) for x in items if isinstance(x, dict) and x.get("id")]
@@ -307,7 +323,9 @@ def auto_pick(family, duration, rng, recent, prompt="", brief=None):
     tried = []
     for term in pool[:5]:
         tried.append(term)
-        res = search(term, limit=40, offset=int(rng.integers(0, 2)) * 20, instrumental=instrumental, bpm_min=bmin, bpm_max=bmax)
+        res = search(term, limit=PAGE, offset=int(rng.integers(0, 2)) * PAGE, instrumental=instrumental, bpm_min=bmin, bpm_max=bmax)
+        if not res["results"]:  # fewer than 40 matches: the first page
+            res = search(term, limit=PAGE, instrumental=instrumental, bpm_min=bmin, bpm_max=bmax)
         if not res["results"] and (bmin or bmax):
             res = search(term, limit=40, instrumental=instrumental)
         good = [t for t in res["results"] if (t["length"] or 0) >= min(duration * 0.6, duration + 5) and f"es:{t['id']}" not in recent]

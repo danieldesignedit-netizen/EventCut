@@ -69,6 +69,7 @@ def run(clip=None, use_downloads=False):
         info = media.probe(src)
         dur = float(info.get("duration") or 3)
         dst = WORK / "_selftest" / f"skim-{uuid.uuid4().hex[:6]}.mp4"
+        dst.parent.mkdir(parents=True, exist_ok=True)
         from . import quick
         t0 = time.time()
         quick.make_quick_proxy(src, dst, info)
@@ -97,11 +98,31 @@ def run(clip=None, use_downloads=False):
         if not c["use"]:
             return False, "Google AI is switched off in Settings."
         model = gemini.test_key(c["key"], c["tier"])
-        body = {"contents": [{"role": "user", "parts": [{"text": "Reply with the single word OK."}]}]}
-        r = gemini._req("POST", f"{gemini.API}/v1beta/models/{model}:generateContent", c["key"], body=body, timeout=60)
-        gemini.log_spend(r.get("usageMetadata", {}), c["tier"])
+        # the same path a real video takes: a tiny preview uploaded and watched with the moment-picking request
+        src = test_clip or _sample_clip()
+        prev = gemini.CACHE / "_check_preview.mp4"
+        try:
+            prev.unlink()
+        except OSError:
+            pass
+        ff, _ = media.tools()
+        prev.parent.mkdir(parents=True, exist_ok=True)
+        media.run([ff, "-y", "-v", "error", "-t", "6", "-i", str(src), "-vf", "fps=1,scale=-2:240", "-c:v", "libx264", "-preset", "veryfast",
+                   "-c:a", "aac", "-b:a", "24k", "-ac", "1", str(prev)])
+        f = gemini.upload(c["key"], prev)
+        try:
+            resp, model, tier = gemini.generate_with(c, f["uri"], gemini._pick_prompt("test", "", 15, 1, 1, 1), gemini.PICK_SCHEMA)
+        finally:
+            try:
+                gemini._req("DELETE", f"{gemini.API}/v1beta/{f['name']}", c["key"], timeout=20)
+            except Exception:
+                pass
+        gemini.log_spend(resp.get("usageMetadata", {}), tier)
+        gemini._json_from(resp)
         spent = gemini.month_spend()
-        return f"Works with {model}. Spent this month: US${spent:.2f} of {c['cap']:.0f}."
+        notes = " ".join(gemini.take_switch_notes())
+        return (f"Works with {gemini.pretty(model)}: it watched a test preview and chose moments. {notes} "
+                f"Spent this month: US${spent:.2f} of {c['cap']:.0f}.").replace("  ", " ")
     res.append(_check("Google AI (Gemini)", google))
 
     # speech

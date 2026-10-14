@@ -1,5 +1,6 @@
 """Rendering: shot list -> graded, reframed segments -> transitions -> titles/logo/captions -> mixed audio -> exports."""
 import json
+import re
 import math
 import os
 import platform
@@ -231,11 +232,35 @@ class Renderer:
         return grade.lab_stats(cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255)
 
     # ------------------------------------------------------------- one shot
+    def render_checked(self, i, shot, extra_tail=0.0):
+        """Render a shot and make sure its picture really lasts as long as planned (a decoder or graphics-card encoder
+        can quietly drop frames on some files). A short shot is re-made on the processor; if a little is still
+        missing the last picture is held for those frames; if much is missing, it counts as a failed shot."""
+        need = shot["length"] + extra_tail
+        out = self.render_shot(i, shot, extra_tail)
+        got = media.video_length(str(out), self.fps)
+        if got >= need - 1.5 / self.fps:
+            return out
+        print(f"shot {i} came out short ({got:.2f} of {need:.2f} s) from {Path(shot['src']).name}: re-making it on the processor")
+        out = self.render_shot(i, shot, extra_tail, safe=True)
+        got = media.video_length(str(out), self.fps)
+        if got >= need - 1.5 / self.fps:
+            self.remade.append(i)
+            return out
+        if got >= need * 0.6:
+            fixed = out.with_name(out.stem + "_pad.mov")
+            media.run([self.ffmpeg, "-y", "-v", "error", "-i", str(out), "-vf", f"tpad=stop_mode=clone:stop_duration={need - got + 0.2:.3f},"
+                       f"trim=duration={need:.3f},setpts=PTS-STARTPTS", "-af", f"apad,atrim=duration={need:.3f}", "-r", str(self.fps)]
+                      + media.software_intermediate_args() + ["-c:a", "pcm_s16le", str(fixed)])
+            self.remade.append(i)
+            return fixed
+        raise RuntimeError(f"Only {got:.1f} of {need:.1f} s of picture could be read from this part of {Path(shot['src']).name}")
+
     def render_shot_safe(self, i, shot, extra_tail=0.0):
         """Render a shot; if its part of the file is damaged, swap in the best spare moment instead of failing."""
         import threading
         try:
-            return self.render_shot(i, shot, extra_tail)
+            return self.render_checked(i, shot, extra_tail)
         except InterruptedError:
             raise
         except Exception as first:
@@ -258,7 +283,7 @@ class Renderer:
                             face_x=sp.get("face_x", 0.5), fps=sp.get("fps", 25), log=sp.get("log"), moment=sp.get("moment", 0),
                             score=sp.get("score", 0), replaced=old_src)
                 try:
-                    out = self.render_shot(i, shot, extra_tail)
+                    out = self.render_checked(i, shot, extra_tail)
                     with self._spare_lock:
                         self.replaced.append({"shot": i, "was": old_src, "now": shot["src"]})
                     return out
@@ -269,7 +294,7 @@ class Renderer:
                     continue
             raise first
 
-    def render_shot(self, i, shot, extra_tail=0.0):
+    def render_shot(self, i, shot, extra_tail=0.0, safe=False):
         out = self.work / f"shot_{i:04d}.mp4"
         src = shot["src"]
         a = self.an.get(src, {})
@@ -281,15 +306,17 @@ class Renderer:
         args = [self.ffmpeg, "-y", "-v", "error"]
         if shot["kind"] == "photo":
             args += ["-loop", "1", "-t", f"{length:.3f}", "-i", src]
-            sw, sh = info.get("width", W), info.get("height", H)
-            z = max(W / sw, H / sh) * 1.12
-            fx = shot.get("face_x", 0.5)
+            fx = float(shot.get("face_x", 0.5))
             frames = max(1, int(round(length * self.fps)))
-            # gentle push-in toward faces (Ken Burns)
-            vf.append(f"scale={int(sw * z * 1.1) // 2 * 2}:-2")
-            vf.append(f"zoompan=z='min(1+0.10*on/{frames},1.10)':x='({fx}*iw-iw/zoom/2)*(1-0)+0*on':y='ih/2-ih/zoom/2':d={frames}:s={W}x{H}:fps={self.fps}")
+            # cut the photo to the video's shape first (around the faces), then a gentle push-in (Ken Burns):
+            # the picture is never squeezed or stretched, whatever shape the photo is
+            cw, ch = int(W * 1.12) // 2 * 2, int(H * 1.12) // 2 * 2
+            vf.append(f"scale={cw}:{ch}:force_original_aspect_ratio=increase:flags=lanczos")
+            vf.append(f"crop={cw}:{ch}:'max(0,min(iw-{cw},iw*{fx:.3f}-{cw}/2))':'(ih-{ch})/2'")
+            vf.append("setsar=1")
+            vf.append(f"zoompan=z='min(1+0.10*on/{frames},1.10)':x='iw/2-iw/zoom/2':y='ih/2-ih/zoom/2':d={frames}:s={W}x{H}:fps={self.fps}")
         else:
-            args += media.decode_args() + ["-ss", f"{shot['in']:.3f}", "-t", f"{length:.3f}", "-i", src]
+            args += ([] if safe else media.decode_args()) + ["-ss", f"{shot['in']:.3f}", "-t", f"{length:.3f}", "-i", src]
             if media.is_hdr(info):
                 vf.append("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
             sw, sh = info.get("width", W), info.get("height", H)
@@ -303,9 +330,18 @@ class Renderer:
                 vf.append(f"setpts={factor:.3f}*PTS")
             m = a.get("moments", [{}])[shot.get("moment", 0)] if a.get("moments") else {}
             vf += self.framing(shot, a, sw, sh, length)
-            if 0.012 < m.get("shake", 0) <= 0.035 and not self.preview:
-                # stabilise after the reframe: same result, far less work on 4K footage
-                vf.append("deshake=rx=32:ry=32")
+            shake = float(m.get("shake", 0) or 0)
+            if shake > 0.012 and not self.preview and self.s.get("stabilise", True):
+                # smart stabilising after the reframe (same result, far less work on 4K footage): the shake of this
+                # exact shot is measured first, then smoothed away with a small zoom to hide the edges; deliberate
+                # camera moves stay. Falls back to the simple stabiliser if this FFmpeg lacks it.
+                trf = self.stab_measure(i, shot, args, vf, length, shake)
+                if trf:
+                    vf.append("format=yuv420p")
+                    vf.append(f"vidstabtransform=input='{fpath(trf)}':smoothing={int(min(30, 10 + shake * 400))}:optzoom=1:zoom=1"
+                              f":maxangle=0.05:interpol=bicubic:crop=keep")
+                elif shake <= 0.035:
+                    vf.append("deshake=rx=32:ry=32")
             vf.append(f"fps={self.fps}")
         vf.append(f"lut3d=file='{fpath(lut)}'")
         if self.s.get("preset", "Vibrant Cinematic") in ("Vibrant Cinematic", "Cinematic Teal & Orange", "Warm Celebration") and not self.preview:
@@ -329,10 +365,34 @@ class Renderer:
         else:
             args += ["-f", "lavfi", "-t", f"{length:.3f}", "-i", "anullsrc=r=48000:cl=stereo",
                      "-filter_complex", f"[0:v]{','.join(vf)}[v]", "-map", "[v]", "-map", "1:a"]
-        args += ["-r", str(self.fps)] + media.intermediate_args()
+        args += ["-r", str(self.fps)] + (media.software_intermediate_args() if safe else media.intermediate_args())
         args += ["-c:a", "pcm_s16le", "-t", f"{length:.3f}", str(out.with_suffix(".mov"))]
-        media.run_decoding(args)
+        try:
+            media.run_decoding(args)
+        except Exception:
+            if not any("vidstab" in str(x) for x in args):
+                raise
+            # the stabiliser couldn't handle this shot: the same shot without it rather than no shot
+            print("stabiliser skipped for shot", i)
+            args = [re.sub(r",format=yuv420p,vidstabtransform=[^,;\[]*", "", x) if isinstance(x, str) and "vidstab" in x else x
+                    for x in args]
+            media.run_decoding(args)
         return out.with_suffix(".mov")
+
+    def stab_measure(self, i, shot, args, vf, length, shake):
+        """Pass 1 of smart stabilising: measure how this shot shakes (on the reframed picture). Returns the file of
+        measurements, or None if the stabiliser isn't available or the measuring failed."""
+        if not media.has_filter("vidstabdetect"):
+            return None
+        trf = self.work / f"shot_{i:04d}.trf"
+        chain = ",".join(vf + [f"fps={self.fps}", "format=yuv420p", f"vidstabdetect=shakiness={int(min(10, 4 + shake * 120))}:accuracy=9:result='{fpath(trf)}'"])
+        cmd = list(args) + ["-filter_complex", f"[0:v]{chain}[v]", "-map", "[v]", "-an", "-f", "null", "-"]
+        try:
+            media.run_decoding(cmd)
+            return trf if trf.exists() and trf.stat().st_size > 0 else None
+        except Exception as e:
+            print("stabiliser measuring failed:", str(e).splitlines()[0][:120])
+            return None
 
     # ------------------------------------------------------------- framing
     def focus_track(self, shot, a, length):
@@ -477,7 +537,7 @@ class Renderer:
             fc.append(f"[{k}:v]fps={self.fps},format=yuv420p,setsar=1,settb=AVTB,setpts=PTS-STARTPTS[n{k}]")
             fc.append(f"[{k}:a]aresample=48000,asetpts=PTS-STARTPTS[m{k}]")
         prev_v, prev_a = "n0", "m0"
-        lengths = [float(media.probe(str(f))["duration"]) for f in run_files]
+        lengths = [media.video_length(str(f), self.fps) or float(media.probe(str(f))["duration"]) for f in run_files]
         offset = lengths[0]
         for k in range(1, len(run_files)):
             trans = runs[k][0][1]["transition"]
@@ -675,6 +735,25 @@ class Renderer:
             t += s["length"]
         return out
 
+    def bite_words(self):
+        """Subtitles for the statements (most social video plays muted): the real word timings when EventCut heard
+        them, otherwise the quote spread evenly over the statement."""
+        out, t = [], 0.0
+        for s in self.plan["shots"]:
+            if s.get("soundbite"):
+                ws = [w for w in s.get("words") or [] if s["in"] - 0.05 <= w["start"] and w["end"] <= s["out"] + 0.05]
+                if ws:
+                    out += [{"word": w["word"], "start": round(t + max(0.0, w["start"] - s["in"]), 3),
+                             "end": round(t + min(s["length"], w["end"] - s["in"]), 3)} for w in ws]
+                else:
+                    q = (s.get("quote") or "").split()
+                    if q:
+                        step = (s["length"] - 0.4) / len(q)
+                        out += [{"word": " " + w, "start": round(t + 0.2 + i * step, 3), "end": round(t + 0.2 + (i + 1) * step, 3)}
+                                for i, w in enumerate(q)]
+            t += s["length"]
+        return out
+
     def finish_video(self, body, end, captions):
         W, H = self.W, self.H
         out = self.work / "video.mp4"
@@ -768,6 +847,24 @@ class Renderer:
         duck_db = 12 if talk else 7
         duck = 10 ** (-duck_db * speech / 20)
         amb_gain = (0.9 if talk else 0.32) * v_speech
+        # statements: the speaker clear and full, the music well down; the rest of the camera sound kept low, so no
+        # random half-sentences poke through the music
+        spans, t = [], 0.0
+        for s_ in plan.get("shots", []):
+            if s_.get("soundbite"):
+                spans.append((t, t + s_["length"]))
+            t += s_["length"]
+        if spans and not talk:
+            mask = np.zeros(n, dtype=np.float32)
+            for a0, a1 in spans:
+                mask[int(a0 * sr):min(n, int(a1 * sr))] = 1.0
+            mask = np.clip(_moving_avg(mask, int(0.3 * sr)) * 1.4, 0, 1)
+            inside = mask > 0.9
+            rms = float(np.sqrt(np.mean(amb[inside] ** 2))) if inside.any() else 0.0
+            lift = float(np.clip(0.1 / rms, 1.0, 6.0)) if rms > 1e-4 else 1.0  # bring quiet speakers up to a clear level
+            amb_gain = (0.16 + (lift - 0.16) * mask) * v_speech
+            amb_gain = amb_gain[:, None]
+            duck = 10 ** (-16 * mask / 20)
         # level changes along the video (lift for the peak, softer for emotional moments, or the user's own points)
         level = np.ones(n, dtype=np.float32) * (10 ** (float(m.get("gain_db", 0) or 0) / 20))
         pts = sorted(snd.get("gains") or [], key=lambda g: g["t"])
@@ -857,6 +954,7 @@ class Renderer:
         files = [None] * len(shots)
         done = 0
         self.replaced = []
+        self.remade = []
         with ThreadPoolExecutor(workers) as pool:
             futs = {pool.submit(self.render_shot_safe, i, s, tails.get(i, 0.0)): i for i, s in enumerate(shots)}
             for f in as_completed(futs):
@@ -867,13 +965,16 @@ class Renderer:
         self.check()
         self.progress("assemble", 0.2, "Adding transitions")
         body = self.assemble(files)
-        body_len = float(media.probe(str(body))["duration"])
+        body_len = media.video_length(str(body), self.fps)  # the picture, not the sound
+        planned = sum(s["length"] for s in shots)
+        self.short_by = round(planned - body_len, 2) if body_len < planned - 0.5 else 0.0
+        if self.short_by:
+            print(f"body came out {self.short_by:.1f} s shorter than planned ({body_len:.1f} of {planned:.1f} s)")
         self.progress("assemble", 1.0)
         end = None
         if self.s.get("end_card", True) and self.s.get("ending") != "none":
-            end_len = max(1.5, float(self.s.get("duration", 60)) - body_len)
-            if self.plan.get("shortened"):  # not enough footage: keep a normal end card, don't stretch it
-                end_len = max(1.5, float(self.plan.get("end_card") or 2.5))
+            # the end card is always a normal end card: it never stretches to cover missing footage
+            end_len = float(np.clip(float(self.plan.get("end_card") or 2.5), 1.5, 4.0))
             end = self.end_card(end_len)
         captions = None
         if self.s.get("captions") and transcripts:
@@ -882,6 +983,10 @@ class Renderer:
                 captions = self.captions_ass(words)
                 self.write_srt(words)
                 (self.out / "captions.json").write_text(json.dumps(words), "utf-8")  # for the caption editor
+        if captions is None and self.s.get("statement_subtitles", True) and any(x.get("soundbite") for x in shots):
+            words = self.bite_words()
+            if words:
+                captions = self.captions_ass(words)
         self.check()
         self.progress("graphics", 0.3, "Adding titles, logo and captions")
         video = self.finish_video(body, end, captions)
@@ -902,6 +1007,10 @@ class Renderer:
         outputs["seconds"] = round(time.time() - t0, 1)
         if getattr(self, "replaced", None):
             outputs["replaced"] = self.replaced
+        if getattr(self, "remade", None):
+            outputs["remade"] = self.remade
+        if getattr(self, "short_by", 0):
+            outputs["short_by"] = self.short_by
         return outputs
 
     def write_srt(self, words):

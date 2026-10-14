@@ -29,6 +29,28 @@ from .config import (FINISHED, FONTS, HOME, LOGOS, LOGS, LOOKS, MUSIC_UPLOADS, P
 
 JOBS = {}
 ALLOWED_ROOTS = set()
+ROOTS_FILE = WORK / "allowed_folders.json"  # folders you chose before: their files stay usable after a restart
+
+
+def _load_roots():
+    try:
+        ALLOWED_ROOTS.update(json.loads(ROOTS_FILE.read_text("utf-8"))[-200:])
+    except Exception:
+        pass
+
+
+def allow(p):
+    r = p if os.path.isdir(p) else os.path.dirname(p)
+    if r and r not in ALLOWED_ROOTS:
+        ALLOWED_ROOTS.add(r)
+        try:
+            ROOTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            ROOTS_FILE.write_text(json.dumps(sorted(ALLOWED_ROOTS)[-200:]), "utf-8")
+        except OSError:
+            pass
+
+
+_load_roots()
 _auth_cache = {}  # token hash -> (expires, user)
 SPEED_FILE = WORK / "speed.json"
 
@@ -114,6 +136,18 @@ def update_speed(stage, rate):
     SPEED_FILE.write_text(json.dumps(d))
 
 
+def log(msg):
+    """One line in Logs/engine.log (the engine's output goes there)."""
+    try:
+        print(time.strftime("%H:%M:%S"), msg, flush=True)
+    except Exception:
+        pass
+
+
+def _base(key):
+    return re.sub(r"_(\d+x\d+|\d+:\d+|\d+)$", "", key or "")
+
+
 # ------------------------------------------------------------------ jobs
 class Job:
     def __init__(self, kind, payload, user):
@@ -135,17 +169,42 @@ class Job:
         self.stage_key = None
         self.stage_t0 = time.time()
         self.notices = []
+        self.timings = []  # [{"step", "seconds"}] in order: shown on the finished video
 
     def plan_stages(self, weights):
-        """weights: ordered {stage: expected_seconds}."""
-        self.weights = dict(weights)
+        """weights: ordered {stage: expected_seconds}. Each is corrected by how long that step really took on this
+        PC (and this internet connection) in earlier runs."""
+        sp = load_speed()
+        self.weights = {k: v * float(sp.get(f"f_{_base(k)}", 1.0)) for k, v in weights.items()}
+        self.planned = dict(self.weights)
         self.done_w = 0.0
 
+    def close_stage(self):
+        if not self.stage_key:
+            return
+        secs = time.time() - self.stage_t0
+        self.timings.append({"step": self.stage, "key": self.stage_key, "seconds": round(secs, 1)})
+        log(f"[{self.id}] done: {self.stage} in {secs:.1f} s")
+        planned = getattr(self, "planned", {}).get(self.stage_key, 0)
+        raw = planned / max(1e-6, float(load_speed().get(f"f_{_base(self.stage_key)}", 1.0)))
+        if raw >= 5 and secs > 1 and not self.cancelled:
+            f = min(5.0, max(0.2, secs / raw))
+            d = load_speed()
+            k = f"f_{_base(self.stage_key)}"
+            d[k] = round(float(d.get(k, f)) * 0.5 + f * 0.5, 3)
+            try:
+                SPEED_FILE.parent.mkdir(parents=True, exist_ok=True)
+                SPEED_FILE.write_text(json.dumps(d))
+            except OSError:
+                pass
+
     def set_stage(self, key, label):
+        self.close_stage()
         if self.stage_key and self.stage_key in self.weights:
             self.done_w += self.weights[self.stage_key]
         self.stage_key, self.stage, self.note = key, label, ""
         self.stage_t0 = time.time()
+        log(f"[{self.id}] step: {label}")
         self.update(0.0)
 
     def update(self, frac, note=""):
@@ -285,20 +344,24 @@ def ai_colour_pass(analyses, s, job=None, notices=None):
         jpg = WORK / "_thumbs" / f"aicol_{a['key']}_{round(t, 1)}.jpg"
         jpg.parent.mkdir(parents=True, exist_ok=True)
         if not jpg.exists():
-            media.run([ff, "-y", "-v", "error", "-ss", f"{t:.2f}", "-i", a["path"], "-vf", f"scale=768:-2,lut3d=file='{render.fpath(lut)}'",
+            # the small skim copy when there is one: the same colours, without seeking through a 4K file on an external drive
+            src = (s.get("_skim") or {}).get(a["path"]) or a["path"]
+            media.run([ff, "-y", "-v", "error", "-ss", f"{t:.2f}", "-i", src, "-vf", f"scale=768:-2,lut3d=file='{render.fpath(lut)}'",
                        "-frames:v", "1", "-q:v", "4", str(jpg)])
         return a["path"], gemini.colourist(jpg, look, s.get("event_type", ""), analyze.proxy_key(a["path"]))
     out, done = {}, 0
-    with ThreadPoolExecutor(4) as pool:
+    with ThreadPoolExecutor(8) as pool:
         for fut in [pool.submit(one, a) for a in vids]:
             try:
                 p, params = fut.result()
                 out[p] = params
             except gemini.AIError as e:
-                if "reach Google" in str(e) or "spending cap" in str(e) or "rejected" in str(e) or "usage limit" in str(e):
-                    if not offline["yes"] and notices is not None and str(e) != "skipped":
+                # anything but a one-off hiccup stops the colourist for every clip at once (no minutes of failing clip by clip)
+                if str(e) != "skipped" and "returned nothing" not in str(e):
+                    if not offline["yes"] and notices is not None:
                         notices.append(f"The Google AI colourist wasn't used: {gemini.why_not(e)}. "
                                        "Clips got EventCut's standard colour correction instead.")
+                        log(f"colourist stopped: {e}")
                     offline["yes"] = True
                 # this clip keeps the standard correction
             except Exception:
@@ -307,6 +370,25 @@ def ai_colour_pass(analyses, s, job=None, notices=None):
             if job:
                 job.update(done / max(1, len(vids)), f"Clip {done} of {len(vids)}")
     return out
+
+
+def card_picture(o):
+    """A small picture of a finished video for its card (made once, next to the video)."""
+    try:
+        if o.get("thumbnail") and os.path.isfile(o["thumbnail"]):
+            return o["thumbnail"]
+        v = o.get("video")
+        if not v or not os.path.isfile(v):
+            return None
+        out = Path(v).with_name("_card.jpg")
+        if not out.exists():
+            ff, _ = media.tools()
+            dur = float(media.probe(v).get("duration") or 4)
+            media.run([ff, "-y", "-v", "error", "-ss", f"{min(dur * 0.3, 8):.2f}", "-i", v, "-vf", "scale=480:-2", "-frames:v", "1",
+                       "-q:v", "5", str(out)], check=False)
+        return str(out) if out.exists() else None
+    except Exception:
+        return None
 
 
 def export_name(event, fmt, version_dir):
@@ -348,10 +430,16 @@ def run_generate(job: Job):
                     bad.append((m["path"], "damaged or unreadable"))
                     return False
             return True
+        if not items:
+            raise ValueError("No footage was chosen for this video. Choose the files (or open the video again from Your videos and use Regenerate).")
+        gemini.take_switch_notes()
+        log(f"[{job.id}] new video: {len(items)} files, {s.get('duration')} s, {s.get('formats')}, direction: {(s.get('prompt') or '(none)')[:200]}")
         items = [m for m in items if readable(m)]
         vids = [m for m in items if m["kind"] in ("video", "photo")]
         if not vids:
-            raise ValueError("None of the videos or photos could be read. Check the files are still in their folder.")
+            where = sorted({str(Path(b[0]).parent) for b in bad})[:2]
+            raise ValueError("None of the chosen videos or photos could be read" + (f" (looked in {', '.join(where)})" if where else "") +
+                             ". Check the drive is plugged in and the files are still in their folder.")
         foot = sum(float(media.probe(m["path"]).get("duration") or 0) for m in vids if m["kind"] == "video") or 10
         cached = all((analyze.CACHE / f"{analyze.cache_key(m['path'])}.json").exists() for m in vids)
         sp = load_speed()
@@ -369,6 +457,7 @@ def run_generate(job: Job):
         job.plan_stages({"skim": foot * sp.get("skim", 0.12) if skim else 0,
                          "picks": foot * 0.004 + 60 if pick_ai else 0,
                          "analyse": 1 if cached else (dur * 2.2 * 6 * sp["analyse"] if skim else foot * sp["analyse"]),
+                         "statements": 20 if pick_ai else 0,
                          "sync": foot * 0.01 + 5 if any(m["kind"] == "audio" for m in items) else 0,
                          "transcribe": (dur * 40 if skim else foot) * sp["transcribe_fal" if falai.enabled() else "transcribe"] if want_words else 0,
                          "ai": foot * 0.05 + 40 if use_ai else 0,
@@ -480,9 +569,14 @@ def run_generate(job: Job):
                             raise InterruptedError
                         job.update(f, note)
                     try:
-                        r = gemini.pick_moments(clips, s.get("event_type", ""), s.get("prompt", ""), dur, gprog)
+                        r = gemini.pick_moments(clips, s.get("event_type", ""), s.get("prompt", ""), dur, gprog,
+                                                cancelled=lambda: job.cancelled)
                         picks, music_brief = r["picks"], r
                         s["_ai_picks"] = picks
+                        s["_ai_statements"] = r.get("statements", [])
+                        s["_ai_avoid"] = r.get("avoid", [])
+                        log(f"Google AI ({r.get('model')}): {len(picks)} moments, {len(r.get('statements', []))} statements, "
+                            f"{r.get('parts_done')}/{r.get('parts')} parts in {r.get('seconds')} s")
                         if r.get("partial"):
                             notices.append(f"Google AI watched only part of the footage ({r.get('partial_reason')}). "
                                            "EventCut chose moments for the rest itself.")
@@ -497,7 +591,10 @@ def run_generate(job: Job):
             # 3. close look at the chosen stretches only
             job.set_stage("analyse", "Looking closely at the best moments")
             t1 = time.time()
-            wins = quick.plan_windows([q for q in quicks if q["path"] not in full], dur, picks, order)
+            said = s.get("_ai_statements") or []
+            wins = quick.plan_windows([q for q in quicks if q["path"] not in full], dur,
+                                      picks + [{"path": x["path"], "start": max(0.0, x["start"] - 1.5), "end": x["end"] + 1.5, "score": 8}
+                                               for x in said], order)
             todo = [q for q in quicks if q["path"] in wins]
             closes = [None] * len(todo)
             cf_ = [0.0] * len(todo)
@@ -521,6 +618,20 @@ def run_generate(job: Job):
             if secs > 0:
                 update_speed("analyse", (time.time() - t1) / secs)
             s["_skim"] = {q["path"]: q["qproxy"] for q in quicks}
+            # 3b. the statements Google AI heard, snapped to whole sentences
+            if s.get("_ai_statements") and story.template_for(s.get("event_type", "")) != "talk":
+                job.set_stage("statements", "Listening closely to the best statements")
+                from . import soundbites
+                try:
+                    s["_soundbites"] = soundbites.refine(s["_ai_statements"], s["_skim"], lambda f, n="": job.update(f, n),
+                                                         lambda: job.cancelled)
+                    log(f"[{job.id}] statements: " + " | ".join(f"{Path(b['path']).name} {b['start']}-{b['end']}: {b['quote'][:60]}"
+                                                                for b in s["_soundbites"]))
+                except InterruptedError:
+                    raise
+                except Exception as e:
+                    traceback.print_exc()
+                    s["_soundbites"] = []
         if not analyses:
             raise ValueError("None of the videos or photos could be read. Check the files are still in their folder.")
         # 1b. separately recorded sound (recorders, lapel mics, mixing desk) lined up with the camera clips
@@ -729,6 +840,9 @@ def run_generate(job: Job):
             from . import soundplan
             s["_epidemic_expected"] = epidemic.enabled()
             s["sound"] = soundplan.build(plan, s, music, dur, np.random.default_rng((int(s.get("seed", 0)) * 7 + 3) % (2 ** 32)), notices)
+        for n_ in gemini.take_switch_notes():
+            if n_ not in notices:
+                notices.insert(0, n_)
         plan["notices"] = notices
         if bad:
             names = ", ".join(Path(b[0]).name for b in bad[:4]) + (f" and {len(bad) - 4} more" if len(bad) > 4 else "")
@@ -765,10 +879,16 @@ def run_generate(job: Job):
                                f"{', '.join(names[:3])}{' and others' if len(names) > 3 else ''} and {'were' if len(r['replaced']) > 1 else 'was'} "
                                "replaced with the next best moments.")
         plan["notices"] = notices
+        job.close_stage()
+        job.stage_key = None
+        timing = {"total": round(time.time() - job.started, 1), "steps": job.timings}
+        log(f"[{job.id}] finished in {timing['total']:.0f} s: " + ", ".join(f"{t['step']} {t['seconds']:.0f} s" for t in job.timings))
         meta = {"settings": {k: v for k, v in s.items() if k not in ("director_picks", "match_look") and not k.startswith("_")}, "plan": plan,
-                "outputs": results, "created": time.strftime("%Y-%m-%d %H:%M"), "user": job.user.get("email")}
+                "outputs": results, "created": time.strftime("%Y-%m-%d %H:%M"), "user": job.user.get("email"),
+                "media": [{"path": m["path"], "kind": m["kind"]} for m in items], "timing": timing}
         (out_dir / "project.json").write_text(json.dumps(meta, indent=1), "utf-8")
-        job.result = {"folder": str(out_dir), "outputs": results, "plan": plan, "version": out_dir.name, "settings": meta["settings"]}
+        job.result = {"folder": str(out_dir), "outputs": results, "plan": plan, "version": out_dir.name, "settings": meta["settings"],
+                      "timing": timing, "media": meta["media"]}
         job.state, job.stage, job.progress = "done", "Done", 1.0
         job.eta = {"stage_left": 0, "total_left": 0, "elapsed": round(time.time() - job.started)}
         job.push()
@@ -1159,12 +1279,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/pick" and method == "POST":
             paths = pick(self.body().get("mode", "folder"))
             for p in paths:
-                ALLOWED_ROOTS.add(p if os.path.isdir(p) else os.path.dirname(p))
+                allow(p)
             return self.send_json({"paths": paths})
         if path == "/scan" and method == "POST":
             paths = self.body().get("paths", [])
             for p in paths:
-                ALLOWED_ROOTS.add(p if os.path.isdir(p) else os.path.dirname(p))
+                allow(p)
             found, skipped = media.scan(paths)
             out = []
             for m in found:
@@ -1280,7 +1400,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/epidemic/search":
             try:
                 pg = max(1, int(q.get("page", ["1"])[0]))
-                r = epidemic.search(q.get("q", [""])[0], limit=30, offset=(pg - 1) * 30, instrumental=q.get("instrumental", ["0"])[0] == "1")
+                r = epidemic.search(q.get("q", [""])[0], limit=40, offset=(pg - 1) * 40, instrumental=q.get("instrumental", ["0"])[0] == "1")
                 r["more"] = len(r["results"]) >= 30
                 return self.send_json(r)
             except epidemic.EpidemicError as e:
@@ -1313,7 +1433,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/epidemic/sfx":
             try:
                 pg = max(1, int(q.get("page", ["1"])[0]))
-                res = epidemic.sfx_search(q.get("q", ["whoosh"])[0] or "whoosh", 30, (pg - 1) * 30)
+                res = epidemic.sfx_search(q.get("q", ["whoosh"])[0] or "whoosh", 40, (pg - 1) * 40)
                 return self.send_json({"results": res, "more": len(res) >= 30})
             except epidemic.EpidemicError as e:
                 return self.send_json({"error": str(e), "results": []}, 502)
@@ -1361,7 +1481,9 @@ class Handler(BaseHTTPRequestHandler):
             tb = self.body()
             key = (tb.get("key") or gemini.cfg()["key"]).strip()
             try:
-                return self.send_json({"ok": True, "model": gemini.test_key(key, tb.get("tier"))})
+                model = gemini.test_key(key, tb.get("tier"))
+                return self.send_json({"ok": True, "model": model, "name": gemini.pretty(model),
+                                       "notes": gemini.take_switch_notes()})
             except gemini.AIError as e:
                 return self.send_json({"ok": False, "error": str(e)}, 400)
         if path == "/captions":
@@ -1494,9 +1616,12 @@ class Handler(BaseHTTPRequestHandler):
         for pj in sorted(FINISHED.glob("*/Version */project.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:200]:
             try:
                 d = json.loads(pj.read_text("utf-8"))
+                outs = d.get("outputs") or []
+                for o in outs:  # a picture for the card in Your videos, whatever was chosen in Exports
+                    o["card"] = card_picture(o)
                 res.append({"event": pj.parent.parent.name, "version": pj.parent.name, "folder": str(pj.parent),
-                            "created": d.get("created"), "outputs": d.get("outputs"), "settings": d.get("settings"),
-                            "shots": len(d.get("plan", {}).get("shots", []))})
+                            "created": d.get("created"), "outputs": outs, "settings": d.get("settings"),
+                            "shots": len(d.get("plan", {}).get("shots", [])), "timing": d.get("timing")})
             except Exception:
                 pass
         return res
@@ -1540,9 +1665,12 @@ class Handler(BaseHTTPRequestHandler):
         self.cors()
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Type", ctype)
-        if download:
-            from urllib.parse import quote
-            self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(os.path.basename(p))}")
+        # the file's real name, also for "Save video as" / the player's own download button (never "media")
+        from urllib.parse import quote
+        name = os.path.basename(p)
+        ascii_name = re.sub(r'[^A-Za-z0-9._ -]+', "_", name)
+        self.send_header("Content-Disposition", f"{'attachment' if download else 'inline'}; filename=\"{ascii_name}\"; "
+                                                f"filename*=UTF-8''{quote(name)}")
         self.send_header("Content-Length", str(end - start + 1))
         self.end_headers()
         with open(p, "rb") as f:
@@ -1566,7 +1694,13 @@ class Handler(BaseHTTPRequestHandler):
             if media.classify(Path(p)) == "photo":
                 media.run([ff, "-y", "-v", "error", "-i", p, "-vf", f"scale={w}:-2", "-frames:v", "1", str(out)])
             else:
-                media.run([ff, "-y", "-v", "error", "-ss", f"{t:.2f}", "-i", p, "-vf", f"scale={w}:-2", "-frames:v", "1", "-q:v", "4", str(out)])
+                for tt in (t, 1.0, 0.0):  # an unreadable spot gives no picture (FFmpeg doesn't even say so): try earlier
+                    media.run([ff, "-y", "-v", "error", "-ss", f"{tt:.2f}", "-i", p, "-vf", f"scale={w}:-2", "-frames:v", "1", "-q:v", "4",
+                               str(out)], check=False)
+                    if out.exists() and out.stat().st_size > 0:
+                        break
+        if not out.exists():
+            return self.send_json({"error": "No picture could be read from this file"}, 422)
         data = out.read_bytes()
         self.send_response(200)
         self.cors()
@@ -1581,7 +1715,19 @@ class Handler(BaseHTTPRequestHandler):
         p = b.get("path")
         if not p or not path_allowed(p):
             return self.send_json({"error": "File not available"}, 404)
-        out = grade_frame(p, float(b.get("t", 1)), b.get("preset", "Vibrant Cinematic"), float(b.get("intensity", 1)), b.get("log_profile"))
+        t = float(b.get("t", 1))
+        out, last = None, None
+        for tt in (t, 1.0, 0.0):  # a damaged or unreadable spot: try the start of the clip instead
+            try:
+                out = grade_frame(p, tt, b.get("preset", "Vibrant Cinematic"), float(b.get("intensity", 1)), b.get("log_profile"))
+                if out.exists() and out.stat().st_size > 0:
+                    break
+            except Exception as e:
+                last = e
+                out = None
+        if out is None:
+            log(f"look preview failed for {Path(p).name}: {str(last).splitlines()[-1][:160] if last else 'no frame'}")
+            return self.send_json({"error": f"{Path(p).name} can't be previewed"}, 422)
         data = out.read_bytes()
         self.send_response(200)
         self.cors()

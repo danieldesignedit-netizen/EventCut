@@ -233,6 +233,37 @@ def video_encoder_args(quality: str = "high", codec: str = "h264") -> list:
     return ["-c:v", enc, "-preset", "medium" if quality == "high" else "veryfast", "-crf", "18" if quality == "high" else "23"]
 
 
+def video_length(path: str, fps: float = None) -> float:
+    """Real length of the picture (frames counted, not the container's claim, which follows the sound)."""
+    _, ffprobe = tools()
+    p = run([ffprobe, "-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries",
+             "stream=nb_read_packets,r_frame_rate,avg_frame_rate", "-of", "json", str(path)], check=False)
+    try:
+        st = json.loads(p.stdout)["streams"][0]
+    except Exception:
+        return 0.0
+    n = int(st.get("nb_read_packets") or 0)
+    if not fps:
+        num, den = (st.get("avg_frame_rate") or st.get("r_frame_rate") or "25/1").split("/")
+        fps = float(num) / float(den) if float(den or 0) else 25.0
+    return n / fps if fps else 0.0
+
+
+def software_intermediate_args() -> list:
+    return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "12"]
+
+
+_FILTERS = {}
+
+
+def has_filter(name: str) -> bool:
+    if name not in _FILTERS:
+        ff, _ = tools()
+        p = run([ff, "-hide_banner", "-filters"], check=False)
+        _FILTERS[name] = f" {name} " in (p.stdout or b"").decode("utf-8", "replace")
+    return _FILTERS[name]
+
+
 def intermediate_args() -> list:
     """Near-lossless, very fast codec for working files (only the final export is compressed properly)."""
     hw = hardware()

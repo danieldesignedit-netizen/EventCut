@@ -3,6 +3,8 @@
 The plan is pure data (JSON), so the review timeline can show it, lock clips, swap clips and
 Director mode can replace it with an AI-written plan before rendering.
 """
+import datetime
+import os
 import math
 import re
 
@@ -155,11 +157,15 @@ def mood_from_prompt(prompt: str, template: str, rng=None) -> str:
     return "upbeat"
 
 
-def _moment_pool(analyses, terms, transcripts, taste, rng, randomness, director=None, avoid=None, prof=None, ai_picks=None):
+def _moment_pool(analyses, terms, transcripts, taste, rng, randomness, director=None, avoid=None, prof=None, ai_picks=None,
+                 ai_avoid=None):
     director = director or {}
     picks_by = {}
     for p in ai_picks or []:  # Google AI's picks, made from the Direction box
         picks_by.setdefault(p["path"], []).append(p)
+    dull_by = {}
+    for p in ai_avoid or []:  # stretches Google AI saw as uninteresting or cluttered
+        dull_by.setdefault(p["path"], []).append(p)
     avoid = avoid or []
     w = (prof or DEFAULT_PROFILE)["w"]
     photo_mode = (prof or {}).get("_photos", "rarely")
@@ -180,6 +186,8 @@ def _moment_pool(analyses, terms, transcripts, taste, rng, randomness, director=
             # what this kind of event cares about: cheers and applause, faces and emotion, dancing and action
             s += 0.22 * (w["energy"] - 1) * m.get("energy", 0) + 0.18 * (w["faces"] - 1) * min(1, m.get("faces", 0) / 2) \
                 + 0.15 * (w["motion"] - 1) * min(1, m.get("motion", 0) * 12)
+            if a.get("kind") == "video":  # action: movement counts, most of all where faces are small (wide shots of play)
+                s += 0.15 * min(1, m.get("motion", 0) * 12) * (1 - 0.5 * min(1, m.get("faces", 0) / 2))
             hit = 0
             if terms:
                 hit += sum(1 for t in terms if t in name) * 0.3
@@ -193,15 +201,21 @@ def _moment_pool(analyses, terms, transcripts, taste, rng, randomness, director=
             s += rng.gumbel() * randomness  # regenerate = different picks
             if any(v.get("src") == a["path"] and m["start"] < float(v["end"]) and float(v["start"]) < m["end"] for v in avoid):
                 s -= 0.45  # used in the previous version: prefer something new
+            dull = next((d for d in dull_by.get(a["path"], ()) if m["start"] < d["end"] and d["start"] < m["end"]), None)
+            if dull:
+                s -= 0.6  # Google AI: nothing happening, or a cluttered frame
+            ai_hook, ai_what = 0.0, ""
             for p in picks_by.get(a["path"], ()):
                 if m["start"] < p["end"] + 0.5 and p["start"] - 0.5 < m["end"]:
                     s += 0.25 + 0.06 * (float(p.get("score", 5)) - 5)
                     hit += 1  # keeps it in the running even when its picture scores are modest
+                    ai_hook, ai_what = float(p.get("hook", 0) or 0), p.get("what", "")
                     break
             d = director.get(f"{a['path']}|{i}")
             if d:
                 s += d["boost"]
-            pool.append({"director_section": d["section"] if d else None,"src": a["path"], "kind": a["kind"], "idx": i, "m": m, "score": s, "prompt_hit": hit,
+            pool.append({"director_section": d["section"] if d else None, "src": a["path"], "kind": a["kind"], "idx": i, "m": m, "score": s,
+                         "prompt_hit": hit, "ai_hook": ai_hook, "ai_what": ai_what, "ai": bool(ai_what or ai_hook), "dull": bool(dull),
                          "fps": a.get("info", {}).get("fps", 25), "w": a["info"].get("width"), "h": a["info"].get("height"),
                          "log": (a.get("log") or {}).get("profile")})
     return pool
@@ -233,7 +247,7 @@ def plan_edit(analyses, settings, grid, transcripts=None, taste=None):
     terms = prompt_terms(settings.get("prompt", ""))
     pool = _moment_pool(analyses, terms, transcripts, taste, rng, randomness=0.12 if seed else 0.02,
                         director=settings.get("director_picks"), avoid=settings.get("avoid"),
-                        prof=dict(profile_for(settings.get("event_type", "")), _photos=photo_rules(settings, analyses)[0]), ai_picks=settings.get("_ai_picks"))
+                        prof=dict(profile_for(settings.get("event_type", "")), _photos=photo_rules(settings, analyses)[0]), ai_picks=settings.get("_ai_picks"), ai_avoid=settings.get("_ai_avoid"))
     if not pool:
         raise ValueError("No usable shots found. The footage may be too dark, blurry or shaky.")
 
@@ -479,13 +493,77 @@ def _natural_key(path: str):
     return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
 
 
+_PHOTO_TIMES = {}
+
+
+def _photo_time(path):
+    """When a photo was taken (EXIF), as local wall-clock time."""
+    if path in _PHOTO_TIMES:
+        return _PHOTO_TIMES[path]
+    t = None
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            ex = im.getexif()
+            sub = ex.get_ifd(0x8769) if hasattr(ex, "get_ifd") else {}
+            v = sub.get(36867) or ex.get(306)
+            if v:
+                t = datetime.datetime.strptime(str(v).strip()[:19], "%Y:%m:%d %H:%M:%S").timestamp()
+    except Exception:
+        t = None
+    _PHOTO_TIMES[path] = t
+    return t
+
+
+def _clip_time(stamp):
+    """Camera metadata time -> seconds, on this PC's local wall clock. Phones write their own UTC offset, many cameras
+    write UTC ('Z'), some write local time without saying: all are brought to the same clock."""
+    if not stamp:
+        return None
+    v = str(stamp).strip().replace(" ", "T")
+    try:
+        if re.search(r"[+-]\d{4}$", v):
+            v = v[:-2] + ":" + v[-2:]
+        if v.endswith("Z"):
+            v = v[:-1] + "+00:00"
+        d = datetime.datetime.fromisoformat(v)
+        if d.tzinfo is not None:
+            d = d.astimezone().replace(tzinfo=None)  # to local wall-clock time
+        return d.timestamp()
+    except Exception:
+        return None
+
+
+def _device(path):
+    return os.path.dirname(path).lower()
+
+
+def timeline_times(analyses) -> dict:
+    """{path: seconds} when each clip/photo was recorded, every camera on the same clock (local wall-clock time)."""
+    t = {}
+    for a in analyses:
+        if a.get("kind") == "photo":
+            v = _photo_time(a["path"])
+        else:
+            v = _clip_time(a.get("captured"))
+        if v is None:
+            try:  # no metadata: the file's own time (end of recording) minus its length
+                v = os.path.getmtime(a["path"]) - float(a.get("info", {}).get("duration") or 0)
+            except OSError:
+                v = None
+        if v is not None:
+            t[a["path"]] = v
+    return t
+
+
 def source_order(analyses) -> list:
-    """Order clips the way the event happened: camera recording time when most clips have it, else file names
-    (cameras and phones number files in order: IMG_1234, C0001...)."""
+    """Order clips and photos the way the event happened, across all cameras and phones: recording times on one
+    shared clock when most files have them, else file names (cameras and phones number files in order)."""
     paths = [a["path"] for a in analyses]
-    stamped = {a["path"]: a.get("captured") for a in analyses if a.get("captured")}
-    if len(stamped) >= max(1, len(paths) * 0.6):
-        return sorted(paths, key=lambda p: (stamped.get(p) or "9999", _natural_key(p)))
+    times = timeline_times(analyses)
+    if len(times) >= max(1, len(paths) * 0.6):
+        last = max(times.values()) if times else 0
+        return sorted(paths, key=lambda p_: (times.get(p_, last + 1), _natural_key(p_)))
     return sorted(paths, key=_natural_key)
 
 
@@ -517,6 +595,89 @@ def _shot_len(m, beat, pace, calm=False):
     return want if want >= max(0.45, beat * 0.5) else 0.0
 
 
+def pick_soundbites(bites, analyses, body):
+    """The statements that go in the video: the best complete sentences, a few seconds each, from different people/clips."""
+    have = {a["path"]: a for a in analyses if a.get("kind") == "video"}
+    n_max = 1 if body <= 32 else 2 if body <= 75 else 3
+    out, total = [], 0.0
+    for b in sorted(bites or [], key=lambda b: -float(b.get("score", 0))):
+        if len(out) >= n_max or float(b.get("score", 0)) < 6:
+            break
+        L = float(b["end"]) - float(b["start"])
+        if b["path"] not in have or not 2.0 <= L <= 9.5 or total + L > body * 0.35:
+            continue
+        dur = float(have[b["path"]]["info"].get("duration") or 0)
+        if dur and float(b["end"]) > dur + 0.05:
+            continue
+        if any(o["path"] == b["path"] and float(b["start"]) < o["end"] + 3 and o["start"] - 3 < float(b["end"]) for o in out):
+            continue
+        out.append(dict(b, start=float(b["start"]), end=float(b["end"])))
+        total += L
+    return out
+
+
+def _cover_event(analyses, pool, chosen, hook_keys, in_bite, beat, pace, nseg=8):
+    """Whole-event coverage: the event is cut into stretches of time (one clock for every camera). Any stretch that
+    holds a big share of the footage (the match itself, the main ceremony) gets at least one shot, two if it is a
+    quarter or more of everything filmed, even when its pictures score lower than close-ups elsewhere. Room is made by
+    dropping the weakest shots from stretches that already have more than their share."""
+    times = timeline_times(analyses)
+    vids = [a for a in analyses if a.get("kind") == "video" and a["path"] in times]
+    if len(vids) < 2 or not chosen:
+        return
+    dur = {a["path"]: float(a.get("info", {}).get("duration") or 0) for a in vids}
+    t0 = min(times[p] for p in dur)
+    t1 = max(times[p] + dur[p] for p in dur)
+    seg_len = (t1 - t0) / nseg
+    if seg_len <= 1:
+        return
+    foot = [0.0] * nseg
+    for p, d in dur.items():
+        a0, a1 = times[p] - t0, times[p] - t0 + d
+        for k in range(nseg):
+            foot[k] += max(0.0, min(a1, (k + 1) * seg_len) - max(a0, k * seg_len))
+    total = sum(foot) or 1.0
+
+    def seg(src, at):
+        if src not in times:
+            return None
+        return int(min(nseg - 1, max(0, (times[src] + at - t0) / seg_len)))
+
+    n_shots = len(chosen)
+
+    def need(k):  # a fair share of the video for every big part of the event (about half its share of the footage)
+        share = foot[k] / total
+        return max(2 if share >= 0.25 else 1 if share >= 0.10 else 0, int(round(0.45 * share * n_shots)))
+    covered = [0] * nseg
+    for o in chosen:
+        k = seg(o["src"], o["m"]["start"])
+        if k is not None and o["kind"] == "video":
+            covered[k] += 1
+    used = {(o["src"], o["idx"]) for o in chosen} | set(hook_keys)
+    added = []
+    for k in sorted(range(nseg), key=lambda k: -foot[k]):
+        while covered[k] < need(k):
+            cands = [c for c in sorted(pool, key=lambda c: -c["score"]) if c["kind"] == "video" and seg(c["src"], c["m"]["start"]) == k
+                     and (c["src"], c["idx"]) not in used and not in_bite(c)
+                     and not any(o["src"] == c["src"] and abs(o["m"]["start"] - c["m"]["start"]) < 2.5 for o in chosen)]
+            c = next((c for c in cands if _shot_len(c["m"], beat, pace) > 0), None)
+            if c is None:
+                break
+            donors = [o for o in chosen if seg(o["src"], o["m"]["start"]) is not None
+                      and covered[seg(o["src"], o["m"]["start"])] > need(seg(o["src"], o["m"]["start"])) and o not in added]
+            if donors:
+                drop = min(donors, key=lambda o: o["score"])
+                chosen.remove(drop)
+                covered[seg(drop["src"], drop["m"]["start"])] -= 1
+            c = dict(c, len=_shot_len(c["m"], beat, pace), covered=True)
+            chosen.append(c)
+            added.append(c)
+            used.add((c["src"], c["idx"]))
+            covered[k] += 1
+    if added:
+        print(f"coverage: added {len(added)} shots from parts of the event the picks had missed")
+
+
 def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
     """Hook of the very best moments (3-5 s), then the event in the order it happened, using only
     interesting moments, each used once, without near-identical shots."""
@@ -530,7 +691,7 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
     rng = np.random.default_rng(seed)
     pool = _moment_pool(analyses, prompt_terms(settings.get("prompt", "")), transcripts, taste, rng,
                         randomness=0.12 if seed else 0.02, director=settings.get("director_picks"), avoid=settings.get("avoid"),
-                        prof=dict(profile_for(settings.get("event_type", "")), _photos=photo_rules(settings, analyses)[0]), ai_picks=settings.get("_ai_picks"))
+                        prof=dict(profile_for(settings.get("event_type", "")), _photos=photo_rules(settings, analyses)[0]), ai_picks=settings.get("_ai_picks"), ai_avoid=settings.get("_ai_avoid"))
     if not pool:
         raise ValueError("No usable shots found. The footage may be too dark, blurry or shaky.")
     beat = 60.0 / grid["bpm"]
@@ -556,12 +717,31 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
         sig = c["m"].get("sig")
         return any(similarity(sig, p["m"].get("sig")) > limit for p in picked)
 
-    # 1. hook: the very best moments from across the event, 3-5 seconds, varied sources and looks
+    # 0. statements: whole sentences that tell the story (chosen by Google AI, edges snapped to the words)
+    bites = pick_soundbites(settings.get("_soundbites"), analyses, body) if tmpl_name != "talk" else []
+    bite_len = sum(b["end"] - b["start"] for b in bites)
+
+    # 1. hook: 3-4 strong moments from across the event (3-5 seconds). With Google AI, the moments it rated as the
+    #    best openers (peak action or emotion, instantly clear); without it, the most energetic, eventful moments.
     want_hook = 0.0 if settings.get("hook", True) is False or tmpl_name == "talk" else float(np.clip(body * 0.12, 3.0, 5.0))
     hook_len = 0.0
-    hb = beat if beat >= 0.42 else beat * 2  # one beat per hook shot (two if the music is very fast)
-    for c in sorted(good, key=lambda c: -(c["score"] + 0.25 * c["m"].get("energy", 0))):
-        if hook_len >= want_hook - 0.05:
+    hb = beat * 2 if beat < 0.7 else beat  # about a second per hook shot: long enough to see what is happening
+    has_ai_hook = sum(1 for c in good if c.get("ai_hook", 0) >= 6) >= 2
+
+    def hook_key(c):
+        m = c["m"]
+        lively = 0.35 * m.get("energy", 0) + 0.25 * min(1, m.get("motion", 0) * 12)
+        if has_ai_hook:
+            return -(c.get("ai_hook", 0) + 0.3 * c["score"] + lively)
+        return -(c["score"] + lively)
+    for c in sorted(good, key=hook_key):
+        if c.get("dull"):
+            continue
+        if c.get("ai") and c.get("ai_hook", 0) < 5:
+            continue  # Google AI judged it too calm or unclear to open with
+        if not c.get("ai") and c["m"].get("energy", 0) < 0.12 and c["m"].get("motion", 0) < 0.01:
+            continue  # nothing happening: never an opener
+        if hook_len >= want_hook - 0.05 or (hook and hook_len + hb > want_hook + 0.3):
             break
         avail = c["m"]["end"] - c["m"]["start"]
         if (c["kind"] != "photo" and avail < hb) or too_similar(c, hook, 0.82):
@@ -574,14 +754,17 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
         hook_len += hb
 
     # 2. the story: best moments first, then laid out in the order they happened
-    remaining = body - hook_len
+    remaining = body - hook_len - bite_len
     hook_keys = {(h["src"], h["idx"]) for h in hook}
+
+    def in_bite(c):
+        return any(b["path"] == c["src"] and c["m"]["start"] < b["end"] + 1 and b["start"] - 1 < c["m"]["end"] for b in bites)
     per_scene, picked_len = {}, 0.0
     for c in sorted(good, key=lambda c: -c["score"]):
         if picked_len >= remaining:
             break
-        if (c["src"], c["idx"]) in hook_keys or too_similar(c, hook, 0.9):
-            continue  # never show the hook moments again
+        if (c["src"], c["idx"]) in hook_keys or too_similar(c, hook, 0.9) or in_bite(c):
+            continue  # never show the hook moments again (or the stretch a statement already uses)
         m = c["m"]
         L = _shot_len(m, beat, pace)
         if L <= 0:
@@ -624,6 +807,15 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
         chosen.remove(drop)
         picked_len -= drop["len"]
 
+    _cover_event(analyses, pool, chosen, hook_keys, in_bite, beat, pace)
+    by_path = {a["path"]: a for a in analyses}
+    for b in bites:
+        a = by_path[b["path"]]
+        near = [m for m in a.get("moments", []) if m["start"] < b["end"] and b["start"] < m["end"]]
+        chosen.append({"src": b["path"], "kind": "video", "idx": a["moments"].index(near[0]) if near else 0,
+                       "m": {"start": b["start"], "end": b["end"], "face_x": near[0].get("face_x", 0.5) if near else 0.5},
+                       "score": float(b.get("score", 6)), "prompt_hit": 1, "len": round(b["end"] - b["start"], 3),
+                       "fps": a.get("info", {}).get("fps", 25), "log": (a.get("log") or {}).get("profile"), "bite": b})
     order = {p: i for i, p in enumerate(source_order(analyses))}
     chosen.sort(key=lambda o: (order.get(o["src"], 0), o["m"]["start"]))
     if prof.get("reveal") and len(chosen) > 3:
@@ -635,9 +827,15 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
     def shot(c, length, section):
         m = c["m"]
         cin = 0.0 if c["kind"] == "photo" else m["start"] + max(0.0, ((m["end"] - m["start"]) - length) / 2)
-        return {"src": c["src"], "kind": c["kind"], "in": round(cin, 3), "out": round(cin + length, 3), "length": round(length, 4),
-                "section": section, "face_x": m.get("face_x", 0.5), "fps": c["fps"], "log": c["log"], "moment": c["idx"],
-                "score": round(c["score"], 3), "prompt_hit": c["prompt_hit"] > 0}
+        out = {"src": c["src"], "kind": c["kind"], "in": round(cin, 3), "out": round(cin + length, 3), "length": round(length, 4),
+               "section": section, "face_x": m.get("face_x", 0.5), "fps": c["fps"], "log": c["log"], "moment": c["idx"],
+               "score": round(c["score"], 3), "prompt_hit": c["prompt_hit"] > 0}
+        if c.get("ai_what"):
+            out["what"] = c["ai_what"]
+        if c.get("bite"):
+            out.update(soundbite=True, quote=c["bite"].get("quote", ""), speaker=c["bite"].get("speaker", ""),
+                       words=c["bite"].get("words") or [])
+        return out
 
     shots = [shot(h, hb, "hook") for h in hook]
     total_story = sum(o["len"] for o in chosen) or 1
@@ -656,6 +854,11 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
                    f"so the video is shorter than {int(duration)} seconds instead of repeating shots. Add more footage for a longer cut.")
     assign_transitions_chrono(shots, tmpl_name, rng, settings.get("transition_amount", "normal"), TRANSITION_SETS.get(prof["trans"]))
     tame_moves(shots, tmpl_name, rng, settings.get("transition_amount", "normal"))
+    for i, s in enumerate(shots):  # a statement starts and ends cleanly: no whips or zooms over someone speaking
+        if s.get("soundbite"):
+            s["transition"] = "dissolve" if i else "cut"
+            if i + 1 < len(shots) and shots[i + 1]["transition"] not in ("cut", "dissolve", "dip"):
+                shots[i + 1]["transition"] = "dissolve"
     leaks, tt = [], 0.0
     for i, s in enumerate(shots):
         if i and s["transition"] != "cut" and len(leaks) < prof.get("leaks", 4) and (s["section"] != shots[i - 1]["section"] or rng.random() < 0.3):

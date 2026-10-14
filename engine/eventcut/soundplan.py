@@ -68,6 +68,16 @@ def _length(path):
         return 0.0
 
 
+def bite_spans(plan: dict) -> list:
+    """(start, end) on the video's timeline of every statement."""
+    out, t = [], 0.0
+    for s in plan.get("shots", []):
+        if s.get("soundbite"):
+            out.append((t, t + s["length"]))
+        t += s["length"]
+    return out
+
+
 def cues(plan: dict, amount: str = "normal") -> list:
     """Where effects belong: whooshes on accented transitions, a riser into the drop, an impact on it, a sting at the end."""
     from .render import XFADE
@@ -105,6 +115,9 @@ def cues(plan: dict, amount: str = "normal") -> list:
             if all(abs(tt - c["at"]) > 2.0 for c in out):
                 out.append({"kind": "impact", "at": round(tt, 3)})
         out.append({"kind": "sting", "at": round(max(0.0, body - 0.1), 3)})
+    # nothing over someone speaking: statements stay clean
+    spans = bite_spans(plan)
+    out = [c for c in out if not any(a - 0.3 <= c["at"] <= b - 0.2 for a, b in spans) or c["kind"] == "sting"]
     # no two effects on top of each other
     out.sort(key=lambda c: c["at"])
     clean = []
@@ -203,7 +216,13 @@ def build(plan: dict, settings: dict, music: dict, total: float, rng=None, notic
          "title": music.get("title") or (Path(mpath).stem if mpath else music.get("mood")), "id": music.get("es_id") or (epidemic_id(mpath) if mpath else None),
          "source": ("Epidemic Sound" if src == "epidemic" else source_of(mpath)) if mpath else "EventCut original",
          "mood": music.get("mood"), "version": bool(music.get("version"))}
-    return {"music": m, "gains": gains, "sfx": sfx, "total": round(total, 3), "made": time.strftime("%Y-%m-%d %H:%M")}
+    statements, t = [], 0.0
+    for s_ in plan.get("shots", []):
+        if s_.get("soundbite"):
+            statements.append({"at": round(t, 3), "length": round(s_["length"], 3), "quote": s_.get("quote", ""), "speaker": s_.get("speaker", "")})
+        t += s_["length"]
+    return {"music": m, "gains": gains, "sfx": sfx, "statements": statements, "total": round(total, 3),
+            "made": time.strftime("%Y-%m-%d %H:%M")}
 
 
 def sound_list(sound: dict) -> list:
@@ -218,15 +237,18 @@ def sound_list(sound: dict) -> list:
     for x in sorted(sound.get("sfx", []), key=lambda x: x["at"]):
         out.append({"type": f"Sound effect ({x['kind']})", "title": x["title"], "source": x["source"], "id": x.get("id"),
                     "at": x["at"], "detail": ""})
+    for b in sound.get("statements", []):
+        out.append({"type": "Statement", "title": f"\u201c{b.get('quote', '')}\u201d", "source": "Original event sound", "id": None,
+                    "at": b.get("at", 0.0), "detail": (b.get("speaker") or "") + ", music lowered"})
     out.append({"type": "Event sound", "title": "Speech and crowd from the footage", "source": "Original event sound", "id": None,
-                "at": 0.0, "detail": "lowered under music, raised for speeches"})
+                "at": 0.0, "detail": "kept low under the music" if sound.get("statements") else "lowered under music, raised for speeches"})
     return out
 
 
 def sound_list_text(sound: dict, video_name: str) -> str:
     lines = [f"Sound list for {video_name}", ""]
     for it in sound_list(sound):
-        when = f"at {int(it['at'] // 60)}:{it['at'] % 60:04.1f}  " if it["type"].startswith("Sound effect") else ""
+        when = f"at {int(it['at'] // 60)}:{it['at'] % 60:04.1f}  " if it["type"].startswith(("Sound effect", "Statement")) else ""
         ident = f"  (Epidemic ID {it['id']})" if it.get("id") and it["source"] == "Epidemic Sound" else ""
         lines.append(f"- {it['type']}: {it['title']}  |  {it['source']}{ident}  {when}{it['detail']}".rstrip())
     return "\n".join(lines) + "\n"
