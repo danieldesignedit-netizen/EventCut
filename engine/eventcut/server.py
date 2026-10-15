@@ -260,6 +260,63 @@ def project_dir(name):
     return d
 
 
+def preview_edit(b):
+    """Join the given clips (as edited in the editor) into a small, fast MP4: 360p, straight cuts, the music underneath
+    and the clips' own sound (statements at full level). Cached, so playing the same edit again is instant."""
+    shots = [x for x in (b.get("shots") or []) if x.get("src") and path_allowed(x["src"]) and os.path.isfile(x["src"])][:40]
+    if not shots:
+        raise ValueError("Nothing to preview")
+    from .render import FORMATS
+    W, H = FORMATS.get(b.get("format", "9:16"), FORMATS["9:16"])
+    sc = 360 / min(W, H)
+    W, H = int(W * sc) // 2 * 2, int(H * sc) // 2 * 2
+    music = b.get("music") or {}
+    mpath = music.get("path") if music.get("path") and path_allowed(music["path"]) and os.path.isfile(music["path"]) else None
+    tag = hashlib.sha1(json.dumps([shots, W, H, mpath, music.get("start"), b.get("t0")], sort_keys=True).encode()).hexdigest()[:16]
+    folder = WORK / "_previews"
+    folder.mkdir(parents=True, exist_ok=True)
+    out = folder / f"edit_{tag}.mp4"
+    if out.exists() and out.stat().st_size > 1000:
+        return {"path": str(out)}
+    ff, _ = media.tools()
+    args, fc, cat = [ff, "-y", "-v", "error"], [], []
+    total = 0.0
+    for i, x in enumerate(shots):
+        L = max(0.1, float(x.get("length") or 1))
+        total += L
+        kind = x.get("kind") or media.classify(Path(x["src"]))
+        info = {} if kind == "photo" else media.probe(x["src"])
+        if kind == "photo":
+            args += ["-loop", "1", "-t", f"{L:.3f}", "-i", x["src"]]
+        else:
+            args += ["-ss", f"{float(x.get('in') or 0):.3f}", "-t", f"{L:.3f}", "-i", x["src"]]
+        fx = float(x.get("face_x", 0.5) or 0.5)
+        tone = ("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p,"
+                if info and media.is_hdr(info) and media.has_filter("zscale") else "")
+        fc.append(f"[{i}:v]{tone}scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}:'max(0,min(iw-{W},iw*{fx:.3f}-{W}/2))':'(ih-{H})/2',"
+                  f"setsar=1,fps=25,format=yuv420p,trim=duration={L:.3f},setpts=PTS-STARTPTS[v{i}]")
+        if kind != "photo" and info.get("has_audio"):
+            vol = 1.0 if x.get("soundbite") else 0.3
+            fc.append(f"[{i}:a]aresample=48000,aformat=channel_layouts=stereo,volume={vol},apad,atrim=duration={L:.3f},asetpts=PTS-STARTPTS[a{i}]")
+        else:
+            fc.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={L:.3f}[a{i}]")
+        cat.append(f"[v{i}][a{i}]")
+    fc.append("".join(cat) + f"concat=n={len(shots)}:v=1:a=1[vv][aa]")
+    amap = "[aa]"
+    if mpath:
+        mi = len(shots)
+        args += ["-ss", f"{float(music.get('start') or 0) + float(b.get('t0') or 0):.3f}", "-t", f"{total:.3f}", "-i", mpath]
+        duck = 0.35 if any(x.get("soundbite") for x in shots) else 0.8
+        fc.append(f"[{mi}:a]aresample=48000,aformat=channel_layouts=stereo,volume={duck}[mm]")
+        fc.append("[aa][mm]amix=inputs=2:duration=first:normalize=0[am]")
+        amap = "[am]"
+    tmp = out.with_suffix(".part.mp4")
+    media.run(args + ["-filter_complex", ";".join(fc), "-map", "[vv]", "-map", amap, "-c:v", "libx264", "-preset", "ultrafast",
+                      "-crf", "30", "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(tmp)], timeout=300)
+    os.replace(tmp, out)
+    return {"path": str(out), "seconds": round(total, 2)}
+
+
 def feed_copy(src):
     """Web copy of a finished video for the homepage feed: 720p (1280 px on the long side), at most 30 s, about 6 MB.
 
@@ -484,7 +541,10 @@ def run_generate(job: Job):
         use_ai = talk and gemini.enabled() and s.get("google_ai", True)
         # Fast watching (always on): skim every clip from its keyframes, then study only the best stretches closely.
         # Podcasts and interviews (a few long recordings where every word matters) and small projects are studied in full.
-        skim = not talk and foot > float(load_settings().get("skim_min_minutes", 15)) * 60
+        ask_open, ask_close = gemini.asked_open_close(s.get("prompt", ""))
+        # "open with ..." / "end with ...": Google AI finds those moments, which needs fast watching even for small projects
+        skim = not talk and (foot > float(load_settings().get("skim_min_minutes", 15)) * 60 or
+                             bool((ask_open or ask_close) and gemini.enabled() and s.get("google_ai", True)))
         notices = job.notices
         s["_notices"] = notices
         want_words = (s.get("captions") or (talk and not use_ai) or (s.get("prompt") and not use_ai and not skim)) and smart.speech_available()
@@ -610,6 +670,7 @@ def run_generate(job: Job):
                         s["_ai_picks"] = picks
                         s["_ai_statements"] = r.get("statements", [])
                         s["_ai_avoid"] = r.get("avoid", [])
+                        s["_ai_open"], s["_ai_close"] = r.get("opening"), r.get("closing")
                         log(f"Google AI ({r.get('model')}): {len(picks)} moments, {len(r.get('statements', []))} statements, "
                             f"{r.get('parts_done')}/{r.get('parts')} parts in {r.get('seconds')} s")
                         if r.get("partial"):
@@ -626,9 +687,10 @@ def run_generate(job: Job):
             job.set_stage("analyse", "Looking closely at the best moments")
             t1 = time.time()
             said = s.get("_ai_statements") or []
+            ends = [x for x in (s.get("_ai_open"), s.get("_ai_close")) if x]
             wins = quick.plan_windows([q for q in quicks if q["path"] not in full], dur,
-                                      picks + [{"path": x["path"], "start": max(0.0, x["start"] - 1.5), "end": x["end"] + 1.5, "score": 8}
-                                               for x in said], order)
+                                      ends + picks + [{"path": x["path"], "start": max(0.0, x["start"] - 1.5), "end": x["end"] + 1.5, "score": 8}
+                                                      for x in said], order)
             todo = [q for q in quicks if q["path"] in wins]
             closes = [None] * len(todo)
             cf_ = [0.0] * len(todo)
@@ -851,6 +913,17 @@ def run_generate(job: Job):
                 analyses = [newer.get(a["path"], a) for a in analyses] + [a for pth, a in newer.items()
                                                                            if pth not in {x["path"] for x in analyses}]
                 plan = story.plan_edit(analyses, s, grid, transcripts, taste)
+        if not p.get("plan"):  # "open with" / "end with" from the Direction box: say plainly when it couldn't be done
+            for asked, used, word, instead in ((ask_open, plan.get("opening_used"), "open", "opens with the strongest moments"),
+                                               (ask_close, plan.get("closing_used"), "end", "ends with the last moments of the day")):
+                if not asked or used:
+                    continue
+                if not s.get("_ai_picks"):
+                    notices.append(f"Your direction asked to {word} with {asked}. That needs Google AI, which wasn't used for this "
+                                   f"video, so it {instead} instead.")
+                else:
+                    notices.append(f"Your direction asked to {word} with {asked}, but Google AI couldn't find that moment in the "
+                                   f"footage, so the video {instead} instead.")
         # Google AI colourist: gentle, per-clip corrections before the look, only for clips in the edit. It runs at the
         # same time as the listening below (both mostly wait on the internet), so it adds almost no time.
         colour_thread = None
@@ -1464,6 +1537,19 @@ class Handler(BaseHTTPRequestHandler):
             for c in out:
                 c["match"] = cameras.match_for(cams, c["sample"]) if c.get("sample") else None
             return self.send_json({"cameras": out, "hero": cams.get("hero"), "auto_hero": cams.get("auto_hero")})
+        if path == "/durations" and method == "POST":
+            # how long each source clip is (the editor stops a trim at the end of the clip)
+            out = {}
+            for p_ in (self.body().get("paths") or [])[:3000]:
+                if path_allowed(p_) and os.path.isfile(p_):
+                    try:
+                        out[p_] = 0 if media.classify(Path(p_)) == "photo" else round(float(media.probe(p_).get("duration") or 0), 3)
+                    except Exception:
+                        out[p_] = None
+            return self.send_json({"durations": out})
+        if path == "/preview-edit" and method == "POST":
+            # a quick, small preview of edited clips (before the real render), so they can be played in the editor
+            return self.send_json(preview_edit(self.body()))
         if path == "/grade-preview" and method == "POST":
             return self.grade_preview(self.body())
         if path == "/library/search":
@@ -1812,9 +1898,18 @@ class Handler(BaseHTTPRequestHandler):
             if media.classify(Path(p)) == "photo":
                 media.run([ff, "-y", "-v", "error", "-i", p, "-vf", f"scale={w}:-2", "-frames:v", "1", str(out)])
             else:
+                try:
+                    hdr = media.is_hdr(media.probe(p))
+                except Exception:
+                    hdr = False
+                vf = ("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,"
+                      "format=yuv420p," if hdr else "") + f"scale={w}:-2"
                 for tt in (t, 1.0, 0.0):  # an unreadable spot gives no picture (FFmpeg doesn't even say so): try earlier
-                    media.run([ff, "-y", "-v", "error", "-ss", f"{tt:.2f}", "-i", p, "-vf", f"scale={w}:-2", "-frames:v", "1", "-q:v", "4",
+                    media.run([ff, "-y", "-v", "error", "-ss", f"{tt:.3f}", "-i", p, "-vf", vf, "-frames:v", "1", "-q:v", "4",
                                str(out)], check=False)
+                    if not (out.exists() and out.stat().st_size > 0) and hdr:  # no zscale in this FFmpeg
+                        media.run([ff, "-y", "-v", "error", "-ss", f"{tt:.3f}", "-i", p, "-vf", f"scale={w}:-2", "-frames:v", "1",
+                                   "-q:v", "4", str(out)], check=False)
                     if out.exists() and out.stat().st_size > 0:
                         break
         if not out.exists():

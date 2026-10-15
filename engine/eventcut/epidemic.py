@@ -82,10 +82,10 @@ def _req(path, params=None, key=None, timeout=30, method="GET", body=None):
         msg = e.read().decode("utf-8", "replace")[:300]
         if e.code == 401:
             raise EpidemicError("Epidemic Sound rejected the API key. Check it in Settings.")
+        if e.code == 402 or (e.code in (403, 429) and re.search(r"quota|allowance|limit reached|exceeded|download limit|upgrade", msg, re.I)):
+            raise EpidemicError(ALLOWANCE)
         if e.code == 403:
             raise EpidemicError("Your Epidemic Sound plan doesn't include this track or action.")
-        if e.code == 402:
-            raise EpidemicError("Your Epidemic Sound plan has no credit left for this.")
         if e.code == 429:
             raise EpidemicError("Epidemic Sound's limit was reached (too many requests or downloads). Try again later.")
         detail = ""
@@ -285,6 +285,22 @@ def _local_sfx(sid):
         if f.stat().st_size > 500:
             return f
     return None
+
+
+ALLOWANCE = ("Your Epidemic Sound downloads allowance is used up (the free developer plan allows 50 downloads in total, "
+             "and they can't be published). Ask Epidemic Sound for a paid API plan to download more")
+
+
+def downloaded_sfx():
+    """Every Epidemic sound effect already on this PC: [{path, title, id}] (reusing them costs no downloads)."""
+    out = []
+    if not SFX_FOLDER.exists():
+        return out
+    for f in SFX_FOLDER.glob("*.mp3"):
+        m = re.match(r"(.*) \[([^\]]+)\]$", f.stem)
+        if m and f.stat().st_size > 500:
+            out.append({"path": str(f), "title": m.group(1), "id": m.group(2), "source": "Epidemic Sound"})
+    return out
 
 
 def sfx_download(sid, title=""):

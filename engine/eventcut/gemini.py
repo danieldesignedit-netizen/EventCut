@@ -243,7 +243,13 @@ def call_model(c, body, timeout=900, fallback_flash=True):
             if model != first:
                 with _lock_m:
                     _switches.append(f"{pretty(first)} isn't available to your key any more, so EventCut used {pretty(model)} instead.")
-            USED.update(model=model, tier=tier, at=time.time())
+            if USED.get("model") != model:
+                USED.update(model=model, tier=tier, at=time.time())
+                try:  # remembered, so Settings can say which model was used even after the engine restarts
+                    CACHE.mkdir(parents=True, exist_ok=True)
+                    (CACHE / "used_model.json").write_text(json.dumps(USED), "utf-8")
+                except OSError:
+                    pass
             return resp, model, tier
         except AIError as e:
             msg = str(e)
@@ -261,6 +267,10 @@ def call_model(c, body, timeout=900, fallback_flash=True):
 
 
 USED = {}  # the model actually used last (shown in Settings)
+try:
+    USED.update(json.loads((CACHE / "used_model.json").read_text("utf-8")))
+except Exception:
+    pass
 
 
 # ------------------------------------------------------------------ cost
@@ -714,7 +724,7 @@ say which event it shows: one of {", ".join(e["id"] for e in events)}, or "unsur
 
 
 # ------------------------------------------------------------------ picking the best moments of a big event
-PICK_VERSION = "m3"
+PICK_VERSION = "m4"
 PICK_SCHEMA = {"type": "OBJECT", "properties": {
     "moments": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
         "start": {"type": "STRING"}, "end": {"type": "STRING"}, "what": {"type": "STRING"},
@@ -729,8 +739,25 @@ PICK_SCHEMA = {"type": "OBJECT", "properties": {
         "search": {"type": "STRING"}, "alternatives": {"type": "ARRAY", "items": {"type": "STRING"}},
         "bpm_min": {"type": "NUMBER"}, "bpm_max": {"type": "NUMBER"}, "vocals": {"type": "BOOLEAN"}}},
     "sfx": {"type": "ARRAY", "items": {"type": "STRING"}},
+    "opening": {"type": "OBJECT", "properties": {
+        "start": {"type": "STRING"}, "end": {"type": "STRING"}, "what": {"type": "STRING"}, "score": {"type": "NUMBER"}}},
+    "closing": {"type": "OBJECT", "properties": {
+        "start": {"type": "STRING"}, "end": {"type": "STRING"}, "what": {"type": "STRING"}, "score": {"type": "NUMBER"}}},
     "summary": {"type": "STRING"}},
     "required": ["moments"]}
+
+# "open with the trophy", "start with...", "end with the group photo", "finish on..." in the Direction box
+_OPEN_RE = re.compile(r"\b(open(?:s|ing)?|start(?:s|ing)?|begin(?:s|ning)?|kick(?:s)? off|lead(?:s)?)\s+(?:the video\s+)?(?:with|on|by)\s+([^.;!?\n]+)", re.I)
+_CLOSE_RE = re.compile(r"\b(end(?:s|ing)?|finish(?:es|ing)?|close(?:s)?|closing|wrap(?:s)? up)\s+(?:the video\s+)?(?:with|on|by)\s+([^.;!?\n]+)", re.I)
+
+
+def asked_open_close(direction: str):
+    """What the Direction box asks the video to open and end with (plain words), or None."""
+    d = direction or ""
+    o, c = _OPEN_RE.search(d), _CLOSE_RE.search(d)
+    clean = lambda m: re.split(r",\s*(?:then|and then)\b|\s+then\s+|\s+as (?:the|a) (?:hook|opener|opening|ending)\b|"
+                               r"\s+and\s+(?:then\s+)?(?:end|finish|close|wrap)", m.group(2).strip(), flags=re.I)[0].strip(" ,") if m else None
+    return clean(o), clean(c)
 
 
 def why_not(e) -> str:
@@ -804,7 +831,13 @@ quote (the exact words), speaker (who, e.g. "company representative", "business 
 4. Also suggest the music for the whole video (music.search: a short search for a music library like "uplifting afrobeats
 celebration", music.alternatives: 2 other searches, bpm_min and bpm_max, vocals: true only if vocals suit the video),
 up to 6 short sound-effect searches that fit (e.g. "fast whoosh transition", "crowd cheer swell", "cinematic impact"),
-and a one-sentence summary of this part."""
+and a one-sentence summary of this part.
+
+5. OPENING and CLOSING. Only if the editor's direction says how the video should open (for example "open with",
+"start with", "begin with") or end ("end with", "finish on", "close with"): return the single moment in THIS part that
+best matches as opening (or closing): start, end (2 to 8 seconds, inside one clip), what, and score 1-10 for how well
+it matches what was asked. Leave opening and closing out when the direction doesn't ask for them, or when nothing in
+this part matches."""
 
 
 def build_montage(parts, out: Path):
@@ -968,7 +1001,19 @@ def pick_moments(clips, event_type, direction, duration, progress=None, chunk_s=
             if w and w[2] - w[1] >= 1.5:
                 says.append({"path": w[0], "start": w[1], "end": w[2], "quote": str(m.get("quote", ""))[:300],
                              "speaker": str(m.get("speaker", ""))[:60], "score": float(m.get("score") or 5)})
-        results[k] = {"picks": picks, "statements": says, "avoid": avoid, "music": data.get("music") or {},
+        ends = {}
+        for which in ("opening", "closing"):
+            m = data.get(which) or {}
+            s_, e_ = _parse_t(m.get("start")), _parse_t(m.get("end"))
+            if m.get("start") is None or (s_ == 0 and e_ == 0):
+                continue
+            if e_ <= s_:
+                e_ = s_ + 4
+            w = where(s_, e_)
+            if w and w[2] - w[1] >= 0.8:
+                ends[which] = {"path": w[0], "start": w[1], "end": w[2], "what": str(m.get("what", ""))[:120],
+                               "score": float(m.get("score") or 5), "part": k}
+        results[k] = {"picks": picks, "statements": says, "avoid": avoid, "music": data.get("music") or {}, **ends,
                       "sfx": [str(x)[:60] for x in (data.get("sfx") or [])][:8],
                       "summary": str(data.get("summary", ""))[:300], "usd": round(spent, 4), "model": model}
         cached.write_text(json.dumps(results[k]), "utf-8")
@@ -1021,7 +1066,11 @@ def pick_moments(clips, event_type, direction, duration, progress=None, chunk_s=
         for x in r.get("sfx", []):
             if x.lower() not in [y.lower() for y in sfx]:
                 sfx.append(x)
+    # the best match across the parts (a tie goes to the earliest part for the opening, the latest for the closing)
+    opening = max((r["opening"] for r in ok if r.get("opening")), key=lambda x: (x["score"], -x["part"]), default=None)
+    closing = max((r["closing"] for r in ok if r.get("closing")), key=lambda x: (x["score"], x["part"]), default=None)
     return {"picks": picks, "statements": statements, "avoid": avoid, "music": music, "sfx": sfx[:10],
+            "opening": opening, "closing": closing,
             "summaries": [r.get("summary", "") for r in ok], "model": next((r.get("model") for r in ok if r.get("model")), ""),
             "usd": round(sum(r.get("usd", 0) for r in ok if r.get("fresh")), 4), "partial": len(ok) < n,
             "parts": n, "parts_done": len(ok), "seconds": round(time.time() - t0, 1),

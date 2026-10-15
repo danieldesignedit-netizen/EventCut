@@ -956,6 +956,13 @@ class Renderer:
         t0 = time.time()
         shots = self.plan["shots"]
         files = []
+        # hand-trimmed clips can be very short: a transition longer than the clip it leads into becomes a straight cut
+        for i, s in enumerate(shots):
+            s.setdefault("transition", "cut")
+            if i == 0 and s["transition"] in XFADE:
+                s["transition"] = "cut"
+            elif s["transition"] in XFADE and s["length"] < XFADE[s["transition"]][1] + 0.15:
+                s["transition"] = "cut"
         # shots before an accented transition get an extra tail so xfade keeps the beat timing
         tails = {i - 1: XFADE[s["transition"]][1] for i, s in enumerate(shots) if i > 0 and s["transition"] in XFADE}
         from concurrent.futures import ThreadPoolExecutor, as_completed

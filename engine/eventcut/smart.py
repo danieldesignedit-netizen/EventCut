@@ -324,10 +324,22 @@ def month_spend():
 
 
 # ------------------------------------------------------------------ taste learning storage
+_taste_lock = __import__("threading").Lock()
+
+
 def load_taste():
     f = WORK / "taste.json"
-    return json.loads(f.read_text()) if f.exists() else {}
+    with _taste_lock:
+        try:
+            return json.loads(f.read_text()) if f.exists() else {}
+        except (ValueError, OSError):
+            return {}  # a damaged file (e.g. the PC switched off while saving): start learning again
 
 
 def save_taste(t):
-    (WORK / "taste.json").write_text(json.dumps(t))
+    import os
+    f = WORK / "taste.json"
+    with _taste_lock:  # written whole and swapped in, so a reader never sees half a file
+        tmp = f.with_suffix(".tmp")
+        tmp.write_text(json.dumps(t))
+        os.replace(tmp, f)

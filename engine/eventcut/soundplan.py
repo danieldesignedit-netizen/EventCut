@@ -128,11 +128,32 @@ def cues(plan: dict, amount: str = "normal") -> list:
     return clean
 
 
+KIND_WORDS = {"whoosh": ("whoosh", "swoosh", "swish", "swipe", "transition"), "riser": ("riser", "rise", "build", "uplift"),
+              "impact": ("impact", "hit", "boom", "drop", "punch"), "sting": ("sting", "ending", "logo")}
+
+
+def _local_epidemic_sfx(kind, n, used_now):
+    """Epidemic effects already downloaded on this PC that fit this kind, least recently used first."""
+    lo, hi = SFX_LEN[kind]
+    hist = _history()
+    last = {x: i for i, x in enumerate(hist)}
+    out = []
+    for x in epidemic.downloaded_sfx():
+        t = x["title"].lower()
+        if not any(w in t for w in KIND_WORDS[kind]) or f"esfx:{x['id']}" in used_now:
+            continue
+        ln = _length(x["path"])
+        if ln and not (lo <= ln <= hi):
+            continue
+        out.append(dict(x, reused=True))
+    out.sort(key=lambda x: last.get(f"esfx:{x['id']}", -1))  # never used first, then the longest ago
+    return out[:n]
+
+
 def _pick_epidemic_sfx(kind, rng, recent, ideas, n=1):
     """Up to n different, fresh Epidemic effects of this kind (Google AI's ideas first when they match the kind).
     Several are taken from each search, so a video with ten transitions still needs only a search or two."""
-    words = {"whoosh": ("whoosh", "swoosh", "swish", "swipe", "transition"), "riser": ("riser", "rise", "build", "uplift"),
-             "impact": ("impact", "hit", "boom", "drop", "punch"), "sting": ("sting", "ending", "logo")}[kind]
+    words = KIND_WORDS[kind]
     terms = [x for x in ideas if any(w in x.lower() for w in words)] + list(SFX_TERMS[kind])
     lo, hi = SFX_LEN[kind]
     picked, seen = [], set(recent)
@@ -175,18 +196,21 @@ def build(plan: dict, settings: dict, music: dict, total: float, rng=None, notic
     recent = set(_history())
     chosen, used_ids = {}, []
     epi_ok, epi_err = epidemic.enabled(), None
+    reused = 0
     builtin = audio.sfx_families()
     for kind in ("whoosh", "riser", "impact", "sting"):
         if not any(c["kind"] == kind for c in cs):
             continue
         # a different effect at every cue: fresh Epidemic effects first, EventCut's own to fill any gap, and only then a repeat
         n_need = sum(1 for c in cs if c["kind"] == kind)
-        files = []
-        if epi_ok:
+        # effects already downloaded come first (no new downloads); new ones are downloaded only for what's missing
+        files = _local_epidemic_sfx(kind, n_need, set(used_ids)) if settings.get("reuse_sfx", True) else []
+        if epi_ok and len(files) < n_need:
             try:
-                files = _pick_epidemic_sfx(kind, rng, recent | set(used_ids), ideas, n_need)
+                files += _pick_epidemic_sfx(kind, rng, recent | set(used_ids) | {f"esfx:{f['id']}" for f in files}, ideas, n_need - len(files))
             except epidemic.EpidemicError as e:
                 epi_ok, epi_err = False, str(e)
+        reused += sum(1 for f in files if f.get("reused"))
         used_ids += [f"esfx:{f['id']}" for f in files]
         if len(files) < n_need:
             fam = {"sting": "impact"}.get(kind, kind)
@@ -198,7 +222,11 @@ def build(plan: dict, settings: dict, music: dict, total: float, rng=None, notic
             files = [files[int(i)] for i in rng.permutation(len(files))]  # Epidemic and built-in effects mixed through the video
         chosen[kind] = files
     if want_sfx and settings.get("_epidemic_expected") and epi_err:
-        notices.append(f"Epidemic Sound sound effects weren't used: {epi_err.rstrip('.')}. EventCut used its own effects instead.")
+        if reused:
+            notices.append(f"New Epidemic Sound sound effects couldn't be downloaded: {epi_err.rstrip('.')}. EventCut reused "
+                           f"Epidemic effects already on this PC, and its own effects where those ran short.")
+        else:
+            notices.append(f"Epidemic Sound sound effects weren't used: {epi_err.rstrip('.')}. EventCut used its own effects instead.")
     sfx, counters = [], {}
     for c in cs:
         files = chosen.get(c["kind"]) or []

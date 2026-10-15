@@ -721,11 +721,54 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
     bites = pick_soundbites(settings.get("_soundbites"), analyses, body) if tmpl_name != "talk" else []
     bite_len = sum(b["end"] - b["start"] for b in bites)
 
+    # "open with ..." / "end with ..." from the Direction box: the moments Google AI found for them, placed first and last
+    by_path_all = {a["path"]: a for a in analyses}
+
+    def from_spec(spec):
+        if not spec or spec.get("path") not in by_path_all:
+            return None
+        a = by_path_all[spec["path"]]
+        best, bo = None, 0.0
+        for c in pool:
+            if c["src"] != spec["path"]:
+                continue
+            ov = min(c["m"]["end"], spec["end"]) - max(c["m"]["start"], spec["start"])
+            if ov > bo:
+                best, bo = c, ov
+        if best is not None and bo >= 0.5:
+            c = dict(best, m=dict(best["m"]))
+            if bo >= 1.0 and c["kind"] != "photo":  # show the part Google AI pointed at
+                c["m"]["start"], c["m"]["end"] = max(c["m"]["start"], spec["start"]), min(c["m"]["end"], spec["end"])
+        else:
+            ms = a.get("moments") or []
+            near = min(range(len(ms)), key=lambda i: abs(ms[i].get("start", 0) - spec["start"])) if ms else 0
+            nm = ms[near] if ms else {}
+            c = {"src": spec["path"], "kind": a.get("kind", "video"), "idx": near,
+                 "m": {"start": spec["start"], "end": spec["end"], "face_x": nm.get("face_x", 0.5), "sig": nm.get("sig")},
+                 "score": 1.0, "prompt_hit": 1, "fps": a.get("info", {}).get("fps", 25), "log": (a.get("log") or {}).get("profile")}
+        c.update(ai_what=spec.get("what", ""), ai=True, ai_hook=10.0)
+        return c
+    opening, closing = from_spec(settings.get("_ai_open")), from_spec(settings.get("_ai_close"))
+    if opening and closing and opening["src"] == closing["src"] and abs(opening["m"]["start"] - closing["m"]["start"]) < 1.0:
+        closing = None  # the same moment can't be both
+
+    def beats_for(c, want):
+        """A length of whole beats, about `want` seconds, that fits inside the moment."""
+        avail = 99.0 if c["kind"] == "photo" else c["m"]["end"] - c["m"]["start"]
+        n = max(1, int(round(min(want, avail) / beat)))
+        while n > 1 and n * beat > avail + 1e-6:
+            n -= 1
+        return round(min(n * beat, avail), 4)
+
     # 1. hook: 3-4 strong moments from across the event (3-5 seconds). With Google AI, the moments it rated as the
     #    best openers (peak action or emotion, instantly clear); without it, the most energetic, eventful moments.
     want_hook = 0.0 if settings.get("hook", True) is False or tmpl_name == "talk" else float(np.clip(body * 0.12, 3.0, 5.0))
     hook_len = 0.0
     hb = beat * 2 if beat < 0.7 else beat  # about a second per hook shot: long enough to see what is happening
+    if opening:
+        opening["hlen"] = beats_for(opening, max(hb, 1.8))
+        hook_len += opening["hlen"]
+    close_len = beats_for(closing, 2.6) if closing else 0.0
     has_ai_hook = sum(1 for c in good if c.get("ai_hook", 0) >= 6) >= 2
 
     def hook_key(c):
@@ -734,8 +777,13 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
         if has_ai_hook:
             return -(c.get("ai_hook", 0) + 0.3 * c["score"] + lively)
         return -(c["score"] + lively)
+    hook = [opening] if opening else []
     for c in sorted(good, key=hook_key):
         if c.get("dull"):
+            continue
+        if opening and ((c["src"], c["idx"]) == (opening["src"], opening["idx"]) or too_similar(c, [opening], 0.82)):
+            continue
+        if closing and (c["src"], c["idx"]) == (closing["src"], closing["idx"]):
             continue
         if c.get("ai") and c.get("ai_hook", 0) < 5:
             continue  # Google AI judged it too calm or unclear to open with
@@ -750,12 +798,13 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
             continue  # the opening is always moving footage
         if sum(1 for h in hook if h["src"] == c["src"]) >= max(1, len(hook) // 2):
             continue  # spread the hook across clips
+        c["hlen"] = hb
         hook.append(c)
         hook_len += hb
 
     # 2. the story: best moments first, then laid out in the order they happened
-    remaining = body - hook_len - bite_len
-    hook_keys = {(h["src"], h["idx"]) for h in hook}
+    remaining = body - hook_len - bite_len - close_len
+    hook_keys = {(h["src"], h["idx"]) for h in hook} | ({(closing["src"], closing["idx"])} if closing else set())
 
     def in_bite(c):
         return any(b["path"] == c["src"] and c["m"]["start"] < b["end"] + 1 and b["start"] - 1 < c["m"]["end"] for b in bites)
@@ -765,6 +814,8 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
             break
         if (c["src"], c["idx"]) in hook_keys or too_similar(c, hook, 0.9) or in_bite(c):
             continue  # never show the hook moments again (or the stretch a statement already uses)
+        if closing and c["src"] == closing["src"] and c["m"]["start"] < closing["m"]["end"] + 1 and closing["m"]["start"] - 1 < c["m"]["end"]:
+            continue  # saved for the ending
         m = c["m"]
         L = _shot_len(m, beat, pace)
         if L <= 0:
@@ -818,7 +869,10 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
                        "fps": a.get("info", {}).get("fps", 25), "log": (a.get("log") or {}).get("profile"), "bite": b})
     order = {p: i for i, p in enumerate(source_order(analyses))}
     chosen.sort(key=lambda o: (order.get(o["src"], 0), o["m"]["start"]))
-    if prof.get("reveal") and len(chosen) > 3:
+    if closing:
+        closing["len"] = close_len
+        chosen.append(closing)  # the ending asked for in the Direction box: always the last shot
+    elif prof.get("reveal") and len(chosen) > 3:
         # product launch: build up, then land on the biggest moment (the reveal) at the end
         big = max(chosen, key=lambda o: o["m"].get("energy", 0) + min(1, o["m"].get("motion", 0) * 12) + 0.5 * o["score"])
         chosen.remove(big)
@@ -837,7 +891,7 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
                        words=c["bite"].get("words") or [])
         return out
 
-    shots = [shot(h, hb, "hook") for h in hook]
+    shots = [shot(h, h.get("hlen", hb), "hook") for h in hook]
     total_story = sum(o["len"] for o in chosen) or 1
     t = 0.0
     for o in chosen:
@@ -868,7 +922,8 @@ def plan_chronological(analyses, settings, grid, transcripts=None, taste=None):
         leaks = []
     return {"template": tmpl_name, "order": "chronological", "bpm": grid["bpm"], "slowmo": prof.get("slowmo", True), "profile": prof["trans"],
             "sections": [{"name": "hook", "start": 0, "end": round(hook_len, 3)}, {"name": "story", "start": round(hook_len, 3), "end": round(total, 3)}],
-            "shots": shots, "body": round(total, 3), "end_card": round(end_card if shortened else max(end_card, duration - total), 3),
+            "shots": shots, "body": round(total, 3), "opening_used": bool(opening), "closing_used": bool(closing),
+            "end_card": round(end_card if shortened else max(end_card, duration - total), 3),
             "drop_at": round(hook_len, 3) if hook_len else round(min(total * 0.3, 8 * beat * 4), 3),
             "mood": settings.get("music_mood") or music_family(settings),
             "leaks": leaks, "warning": warning, "shortened": shortened,
