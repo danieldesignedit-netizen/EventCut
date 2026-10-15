@@ -30,6 +30,7 @@ FAMILY_TERMS = {
     "corporate": ["uplifting corporate", "inspiring", "motivational", "positive afro"],
     "chill": ["chill", "lofi", "acoustic chill", "afro chill"],
     "emotional": ["emotional piano", "hopeful strings", "inspirational", "heartfelt"],
+    "uplifting": ["uplifting celebration", "feel good afro", "hopeful uplifting", "inspiring celebration", "joyful"],
 }
 # genre words in the Direction box win over the family
 PROMPT_TERMS = ["amapiano", "afrobeats", "afrobeat", "afro house", "afro", "highlife", "hip hop", "trap", "gospel",

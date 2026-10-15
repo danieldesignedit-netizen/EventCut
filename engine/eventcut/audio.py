@@ -167,6 +167,7 @@ MOODS = {
 FAMILIES = {}
 for _n, _c in MOODS.items():
     FAMILIES.setdefault(_c["family"], []).append(_n)
+FAMILIES.setdefault("uplifting", FAMILIES.get("corporate", []) + FAMILIES.get("upbeat", []))  # warm and positive
 
 
 def style_cfg(mood: str, seed: int = 0) -> dict:
@@ -491,6 +492,7 @@ def sfx_families() -> dict:
 # ---------------------------------------------------------------- online library (Openverse)
 OPENVERSE = "https://api.openverse.org/v1/audio/"
 FAMILY_QUERIES = {
+    "uplifting": ["uplifting", "happy", "inspiring", "celebration", "positive"],
     "upbeat": ["upbeat", "afrobeat", "happy dance", "party", "energetic pop", "funk", "house music"],
     "cinematic": ["cinematic", "epic", "trailer", "dramatic", "orchestral"],
     "corporate": ["corporate", "inspiring", "technology", "motivational", "positive"],

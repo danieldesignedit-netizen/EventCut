@@ -37,7 +37,7 @@ TEMPLATES = {
 EVENT_TYPES = {
     "Watch party": "celebration", "Team bonding": "celebration", "Anniversary": "celebration",
     "End-of-year party": "celebration", "CSR": "corporate", "Product launch": "celebration",
-    "Conference": "talk", "Award night": "celebration", "Podcast": "talk", "Vox pop": "talk",
+    "Conference": "talk", "Award night": "celebration", "Prize presentation": "celebration", "Podcast": "talk", "Vox pop": "talk",
     "Interview": "talk", "Panel": "talk",
 }
 
@@ -68,6 +68,9 @@ PROFILES = {
                           "w": {"energy": 1.7, "faces": 1.4, "motion": 0.7}, "trans": "cinematic", "slowmo": True, "variety": 0.92, "leaks": 3},
     "Conference":        {"template": "talk", "music": "corporate", "look": "Clean Corporate", "pace": 1.0,
                           "w": {"energy": 0.8, "faces": 1.3, "motion": 0.6}, "trans": "corporate", "slowmo": False, "variety": 0.92, "leaks": 0},
+    # each winner clearly seen: handovers, handshakes, cheques and prizes, faces and applause; warm and a little slower
+    "Prize presentation": {"template": "celebration", "music": "uplifting", "look": "Warm Celebration", "pace": 1.3,
+                          "w": {"energy": 1.2, "faces": 1.7, "motion": 0.6}, "trans": "cinematic", "slowmo": True, "variety": 0.9, "leaks": 2},
     "Product launch":    {"template": "celebration", "music": "cinematic", "look": "Cinematic Teal & Orange", "pace": 1.0,
                           "w": {"energy": 1.4, "faces": 0.9, "motion": 1.4}, "trans": "sleek", "slowmo": False, "variety": 0.92, "leaks": 2,
                           "reveal": True},

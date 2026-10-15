@@ -1,4 +1,5 @@
 """Rendering: shot list -> graded, reframed segments -> transitions -> titles/logo/captions -> mixed audio -> exports."""
+import hashlib
 import json
 import re
 import math
@@ -13,6 +14,7 @@ import numpy as np
 from . import audio, fxtrans, grade, media
 from .config import FONTS, HOME, LOGOS, SFX_ORIGINALS, tools
 
+SHOT_KEY_VERSION = 1  # bump when the way a clip is rendered changes, so older pieces aren't reused
 FORMATS = {"9:16": (1080, 1920), "16:9": (1920, 1080), "1:1": (1080, 1080), "4:5": (1080, 1350)}
 # transition name -> (FFmpeg xfade style, duration in seconds)
 XFADE = {
@@ -268,11 +270,42 @@ class Renderer:
             return fixed
         raise RuntimeError(f"Only {got:.1f} of {need:.1f} s of picture could be read from this part of {Path(shot['src']).name}")
 
+    def shot_key(self, shot, extra_tail):
+        """Everything that decides how a rendered clip looks: the same key means the same picture and sound."""
+        keep = {k: shot.get(k) for k in ("src", "kind", "in", "length", "face_x", "section", "score", "fps", "log", "layouts", "moment")}
+        keep["in"] = round(float(keep["in"] or 0), 3)
+        keep["length"] = round(float(keep["length"] or 0) + float(extra_tail or 0), 4)
+        # numbers come back from the website as JSON (24.0 becomes 24), so compare them as rounded floats
+        num = lambda v: round(float(v), 4) if isinstance(v, (int, float)) and not isinstance(v, bool) else v
+        keep = {k: num(v) for k, v in keep.items()}
+        extra = [self.W, self.H, self.fps, self.preview, Path(str(self.lut_for_source(shot["src"]))).name, self.s.get("framing", "auto"),
+                 self.s.get("stabilise", True), self.plan.get("slowmo", True), SHOT_KEY_VERSION]
+        return hashlib.sha1(json.dumps([keep, extra], sort_keys=True, default=str).encode()).hexdigest()[:20]
+
     def render_shot_safe(self, i, shot, extra_tail=0.0):
-        """Render a shot; if its part of the file is damaged, swap in the best spare moment instead of failing."""
+        """Render a shot; if its part of the file is damaged, swap in the best spare moment instead of failing.
+        A clip already rendered exactly like this in the version being edited is reused instead (Render changes)."""
         import threading
+        key = self.shot_key(shot, extra_tail)
+        hit = self.reuse.get(key)
+        if hit and os.path.isfile(hit):
+            out = self.work / f"shot_{i:04d}.mov"
+            try:
+                if out.exists():
+                    out.unlink()
+                try:
+                    os.link(hit, out)  # same drive: instant, no extra space
+                except OSError:
+                    shutil.copyfile(hit, out)
+                self.manifest[key] = str(out)
+                self.reused += 1
+                return out
+            except OSError:
+                pass
         try:
-            return self.render_checked(i, shot, extra_tail)
+            out = self.render_checked(i, shot, extra_tail)
+            self.manifest[key] = str(out)
+            return out
         except InterruptedError:
             raise
         except Exception as first:
@@ -974,6 +1007,12 @@ class Renderer:
         done = 0
         self.replaced = []
         self.remade = []
+        self.manifest, self.reused, self.reuse = {}, 0, {}
+        if self.s.get("_reuse_shots"):
+            try:
+                self.reuse = json.loads(Path(self.s["_reuse_shots"]).read_text("utf-8"))
+            except Exception:
+                self.reuse = {}
         with ThreadPoolExecutor(workers) as pool:
             futs = {pool.submit(self.render_shot_safe, i, s, tails.get(i, 0.0)): i for i, s in enumerate(shots)}
             for f in as_completed(futs):
@@ -982,6 +1021,12 @@ class Renderer:
                 done += 1
                 self.progress("render", done / len(shots), f"Grading and reframing shot {done} of {len(shots)}")
         self.check()
+        try:  # which rendered clip is which, so the next Render changes can reuse the untouched ones
+            (self.work / "shots.json").write_text(json.dumps(self.manifest), "utf-8")
+        except OSError:
+            pass
+        if self.reused:
+            print(f"reused {self.reused} of {len(shots)} clips from the version being edited")
         self.progress("assemble", 0.2, "Adding transitions")
         body = self.assemble(files)
         body_len = media.video_length(str(body), self.fps)  # the picture, not the sound

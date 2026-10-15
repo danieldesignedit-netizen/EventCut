@@ -10,6 +10,7 @@ import json
 import os
 import threading
 import re
+import shutil
 import time
 import urllib.error
 import urllib.request
@@ -798,12 +799,20 @@ def why_not(e) -> str:
     return first[:160] or "Google AI returned an error"
 
 
+EVENT_HINTS = {
+    "prize presentation": "This is a prize presentation: find every prize, cheque or gift being handed over, the handshake, "
+                          "and the winner's reaction and the applause around it. Each winner should be clearly seen.",
+    "csr": "This is a company's community (CSR) event: what the company gave or did, the people it helped, and their reactions.",
+}
+
+
 def _pick_prompt(event_type, direction, duration, part, parts, minutes):
     return f"""You are a senior editor cutting a {int(duration)}-second social video of a {event_type or 'company event'}.
 This video is part {part} of {parts} of the raw footage ({minutes} minutes), made of many separate camera clips joined end to end
 (each jump in picture is a new clip). It is a small preview: 1 picture a second, low quality. Judge content, not image quality.
 
 Editor's direction (follow it closely): {direction or '(none: choose what makes the best story for this event)'}
+{EVENT_HINTS.get((event_type or "").strip().lower(), "")}
 
 1. MOMENTS. Find what people would want to see: the main action and emotion of this event (for example goals and
 near-misses, celebrations, trophies and medals being lifted, cheering crowds, gifts or cheques being handed over,
@@ -906,14 +915,30 @@ def pick_moments(clips, event_type, direction, duration, progress=None, chunk_s=
     def show(k, text):
         say(_frac(), text if n == 1 else f"Part {k + 1} of {n}: {text}")
 
-    def tag_of(k):
+    def tag_of(k, version=None):
+        """Saved answers are found by footage, event, direction, length and model (not by EventCut's version), so an
+        update never makes you pay for Google to watch the same footage again."""
         ch = chunks[k]
-        return hashlib.sha1(json.dumps([[Path(sk).name for _, sk, _ in ch], event_type, direction, int(duration), c["tier"],
-                                        PICK_VERSION, k, n]).encode()).hexdigest()[:16]
+        key = [[Path(sk).name for _, sk, _ in ch], event_type, direction, int(duration), c["tier"]] + ([version] if version else []) + [k, n]
+        return hashlib.sha1(json.dumps(key).encode()).hexdigest()[:16]
+
+    def saved(k):
+        f = folder / f"{tag_of(k)}.json"
+        if f.exists():
+            return f
+        for v in ("m4", "m3"):  # answers saved by EventCut 1.8 and 1.9.0
+            old = folder / f"{tag_of(k, v)}.json"
+            if old.exists():
+                try:
+                    shutil.copyfile(old, f)
+                    return f
+                except OSError:
+                    return old
+        return None
 
     def one(k):
         ch = chunks[k]
-        cached = folder / f"{tag_of(k)}.json"
+        cached = saved(k) or folder / f"{tag_of(k)}.json"
         if cached.exists():
             results[k] = json.loads(cached.read_text("utf-8"))
             note_reused()
@@ -1069,12 +1094,37 @@ def pick_moments(clips, event_type, direction, duration, progress=None, chunk_s=
     # the best match across the parts (a tie goes to the earliest part for the opening, the latest for the closing)
     opening = max((r["opening"] for r in ok if r.get("opening")), key=lambda x: (x["score"], -x["part"]), default=None)
     closing = max((r["closing"] for r in ok if r.get("closing")), key=lambda x: (x["score"], x["part"]), default=None)
+    # answers saved before "open with / end with" existed: find those moments among Google's picks by their words
+    ask_o, ask_c = asked_open_close(direction)
+    if ask_o and not opening:
+        opening = _match_pick(picks, ask_o, prefer_hook=True)
+    if ask_c and not closing:
+        closing = _match_pick([p for p in picks if not opening or (p["path"], p["start"]) != (opening["path"], opening["start"])], ask_c)
     return {"picks": picks, "statements": statements, "avoid": avoid, "music": music, "sfx": sfx[:10],
             "opening": opening, "closing": closing,
             "summaries": [r.get("summary", "") for r in ok], "model": next((r.get("model") for r in ok if r.get("model")), ""),
             "usd": round(sum(r.get("usd", 0) for r in ok if r.get("fresh")), 4), "partial": len(ok) < n,
             "parts": n, "parts_done": len(ok), "seconds": round(time.time() - t0, 1),
             "partial_reason": _partial_reason(errors, failed, n) if errors and len(ok) < n else ""}
+
+
+def _match_pick(picks, asked, prefer_hook=False):
+    """The pick whose description best matches the words asked for ("the trophy celebration" -> "trophy lift")."""
+    stop = {"the", "a", "an", "of", "and", "with", "on", "at", "in", "to", "our", "their", "his", "her", "moment", "moments", "shot", "shots"}
+    words = {w for w in re.findall(r"[a-z]{3,}", asked.lower()) if w not in stop}
+    if not words or not picks:
+        return None
+    stems = {w[:5] for w in words}
+    best, bs = None, 0.0
+    for p in picks:
+        got = {w[:5] for w in re.findall(r"[a-z]{3,}", (p.get("what", "") + " " + p.get("kind", "")).lower())}
+        hit = len(stems & got)
+        if not hit:
+            continue
+        sc = hit * 10 + float(p.get("score") or 0) + (0.5 * float(p.get("hook") or 0) if prefer_hook else 0)
+        if sc > bs:
+            best, bs = p, sc
+    return dict(best, score=min(10.0, bs / 3)) if best else None
 
 
 def _partial_reason(errors, failed, n):

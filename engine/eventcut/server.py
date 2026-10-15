@@ -112,10 +112,45 @@ def safe_name(name: str, fallback: str) -> str:
     return name[:120] or fallback
 
 
+_PM = {"at": 0.0, "files": set()}
+
+
+def _project_media():
+    """Every camera file used by a project on this PC (the editor may show and preview them)."""
+    if time.time() - _PM["at"] < 20:
+        return _PM["files"]
+    files = set()
+    try:
+        for pj in FINISHED.glob("*/*/project.json"):
+            try:
+                meta = json.loads(pj.read_text("utf-8"))
+            except Exception:
+                continue
+            for m in meta.get("media") or []:
+                if m.get("path"):
+                    files.add(os.path.normcase(os.path.realpath(m["path"])))
+            for sh in (meta.get("plan") or {}).get("shots") or []:
+                if sh.get("src"):
+                    files.add(os.path.normcase(os.path.realpath(sh["src"])))
+    except Exception:
+        pass
+    _PM.update(at=time.time(), files=files)
+    return files
+
+
 def path_allowed(p: str) -> bool:
-    rp = os.path.realpath(p)
-    roots = {os.path.realpath(str(HOME))} | {os.path.realpath(r) for r in ALLOWED_ROOTS}
-    return any(rp == r or rp.startswith(r + os.sep) for r in roots)
+    """Only files in folders you chose (or EventCut's own folder, or footage of your own projects) can be read."""
+    if not p:
+        return False
+    norm = lambda x: os.path.normcase(os.path.realpath(x))  # Windows: G:\ and g:\ are the same folder
+    rp = norm(p)
+    roots = {norm(str(HOME))} | {norm(r) for r in ALLOWED_ROOTS}
+    if any(rp == r or rp.startswith(r.rstrip(os.sep) + os.sep) for r in roots):
+        return True
+    if rp in _project_media():
+        allow(p)  # remembered from now on
+        return True
+    return False
 
 
 # ------------------------------------------------------------------ speed model for time-left estimates
@@ -263,9 +298,14 @@ def project_dir(name):
 def preview_edit(b):
     """Join the given clips (as edited in the editor) into a small, fast MP4: 360p, straight cuts, the music underneath
     and the clips' own sound (statements at full level). Cached, so playing the same edit again is instant."""
-    shots = [x for x in (b.get("shots") or []) if x.get("src") and path_allowed(x["src"]) and os.path.isfile(x["src"])][:40]
+    asked = [x for x in (b.get("shots") or []) if x.get("src")][:40]
+    missing = [x["src"] for x in asked if not os.path.isfile(x["src"])]
+    if missing:
+        raise ValueError(missing_footage_message(sorted(set(missing))))
+    shots = [x for x in asked if path_allowed(x["src"])]
     if not shots:
-        raise ValueError("Nothing to preview")
+        log(f"preview refused: {[x['src'] for x in asked][:3]} are outside the allowed folders {sorted(ALLOWED_ROOTS)[:5]}")
+        raise ValueError("EventCut isn't allowed to open these camera files yet. Choose their folder once in Create, step 1, then try again.")
     from .render import FORMATS
     W, H = FORMATS.get(b.get("format", "9:16"), FORMATS["9:16"])
     sc = 360 / min(W, H)
@@ -527,11 +567,16 @@ def run_generate(job: Job):
         gemini.DEAD.update(until=0, why="")  # an empty balance stops Google for one run only: a top-up works on the next video
         log(f"[{job.id}] new video: {len(items)} files, {s.get('duration')} s, {s.get('formats')}, direction: {(s.get('prompt') or '(none)')[:200]}")
         items = [m for m in items if readable(m)]
+        for m in items:  # the editor shows and previews these files later
+            allow(m["path"])
         vids = [m for m in items if m["kind"] in ("video", "photo")]
         if not vids:
+            gone = [b[0] for b in bad if b[1] == "missing or moved"]
+            if gone:
+                raise ValueError(missing_footage_message(gone))
             where = sorted({str(Path(b[0]).parent) for b in bad})[:2]
             raise ValueError("None of the chosen videos or photos could be read" + (f" (looked in {', '.join(where)})" if where else "") +
-                             ". Check the drive is plugged in and the files are still in their folder.")
+                             ". They may be damaged, or still copying.")
         foot = sum(float(media.probe(m["path"]).get("duration") or 0) for m in vids if m["kind"] == "video") or 10
         cached = all((analyze.CACHE / f"{analyze.cache_key(m['path'])}.json").exists() for m in vids)
         sp = load_speed()
@@ -996,56 +1041,7 @@ def run_generate(job: Job):
                 f"{len(bad)} file{'s were' if len(bad) > 1 else ' was'} skipped because {'they' if len(bad) > 1 else 'it'} couldn't be read: {names}."
         plan["music"] = {k: music.get(k) for k in ("path", "mood", "title", "creator", "license", "source")}
         job.update(1.0)
-        # 5. render each format
-        out_dir = project_dir(s.get("name") or s.get("event_type") or "Event")
-        results = []
-        for f in formats:
-            fs = dict(s, format=f, name=export_name(s.get("name") or s.get("event_type") or "Event", f, out_dir))
-            fdir = out_dir / f.replace(":", "x")
-            t0 = time.time()
-            job.set_stage(f"render_{f}", f"Rendering {f}")
-            rstate = {"stage": "render"}
-
-            def prog(stage, frac, note="", f=f):
-                if stage != "render" and rstate["stage"] == "render":
-                    rstate["stage"] = "finish"
-                    job.set_stage(f"finish_{f}", f"Finishing {f}")
-                order = {"assemble": 0.25, "graphics": 0.55, "audio": 0.8, "export": 0.95}
-                if stage == "render":
-                    job.update(frac, note)
-                else:
-                    job.update(min(1, order.get(stage, 0) + frac * 0.2), note)
-            r = render.Renderer(plan, fs, analyses, fdir, prog, lambda: job.cancelled).run(transcripts if s.get("captions") else None)
-            try:  # the editable Premiere Pro sequence, next to the video
-                from . import premiere
-                if r.get("video"):
-                    r["premiere"] = premiere.build(plan, s.get("sound") or {}, fs, {a["path"]: a for a in analyses}, r["video"],
-                                                   Path(r["video"]).with_name(Path(r["video"]).stem + " - Premiere.xml"),
-                                                   r.get("width") or 1080, r.get("height") or 1920, int(fs.get("fps", 25)))
-            except Exception as e:
-                log(f"[{job.id}] Premiere export failed: {e}")
-            update_speed("render", (time.time() - t0) * 0.75 / dur)
-            update_speed("finish", (time.time() - t0) * 0.25 / dur)
-            results.append(r)
-            if r.get("replaced") and not any("damaged part" in n for n in notices):
-                names = sorted({Path(x["was"]).name for x in r["replaced"]})
-                notices.append(f"{len(r['replaced'])} shot{'s' if len(r['replaced']) > 1 else ''} came from a damaged part of "
-                               f"{', '.join(names[:3])}{' and others' if len(names) > 3 else ''} and {'were' if len(r['replaced']) > 1 else 'was'} "
-                               "replaced with the next best moments.")
-        plan["notices"] = notices
-        job.close_stage()
-        job.stage_key = None
-        timing = {"total": round(time.time() - job.started, 1), "steps": job.timings}
-        log(f"[{job.id}] finished in {timing['total']:.0f} s: " + ", ".join(f"{t['step']} {t['seconds']:.0f} s" for t in job.timings))
-        meta = {"settings": {k: v for k, v in s.items() if k not in ("director_picks", "match_look") and not k.startswith("_")}, "plan": plan,
-                "outputs": results, "created": time.strftime("%Y-%m-%d %H:%M"), "user": job.user.get("email"),
-                "media": [{"path": m["path"], "kind": m["kind"]} for m in items], "timing": timing}
-        (out_dir / "project.json").write_text(json.dumps(meta, indent=1), "utf-8")
-        job.result = {"folder": str(out_dir), "outputs": results, "plan": plan, "version": out_dir.name, "settings": meta["settings"],
-                      "timing": timing, "media": meta["media"]}
-        job.state, job.stage, job.progress = "done", "Done", 1.0
-        job.eta = {"stage_left": 0, "total_left": 0, "elapsed": round(time.time() - job.started)}
-        job.push()
+        render_outputs(job, plan, s, analyses, transcripts, formats, notices, items, dur)
         play_sound(True)
     except InterruptedError:
         job.state, job.stage = "cancelled", "Cancelled"
@@ -1053,6 +1049,92 @@ def run_generate(job: Job):
     except Exception as e:
         fail_job(job, e)
         play_sound(False)
+
+
+def render_outputs(job, plan, s, analyses, transcripts, formats, notices, media_items, dur, reuse=None):
+    """Render every shape, write the Premiere sequences and project.json, and finish the job (shared by a new video
+    and by Render changes). reuse: {shape: previous version's shots.json}, so unchanged clips aren't rendered again."""
+    # 5. render each format
+    out_dir = project_dir(s.get("name") or s.get("event_type") or "Event")
+    results = []
+    for f in formats:
+        fs = dict(s, format=f, name=export_name(s.get("name") or s.get("event_type") or "Event", f, out_dir),
+                  _reuse_shots=(reuse or {}).get(f))
+        fdir = out_dir / f.replace(":", "x")
+        t0 = time.time()
+        job.set_stage(f"render_{f}", f"Rendering {f}")
+        rstate = {"stage": "render"}
+
+        def prog(stage, frac, note="", f=f):
+            if stage != "render" and rstate["stage"] == "render":
+                rstate["stage"] = "finish"
+                job.set_stage(f"finish_{f}", f"Finishing {f}")
+            order = {"assemble": 0.25, "graphics": 0.55, "audio": 0.8, "export": 0.95}
+            if stage == "render":
+                job.update(frac, note)
+            else:
+                job.update(min(1, order.get(stage, 0) + frac * 0.2), note)
+        r = render.Renderer(plan, fs, analyses, fdir, prog, lambda: job.cancelled).run(transcripts if s.get("captions") else None)
+        try:  # the editable Premiere Pro sequence, next to the video
+            from . import premiere
+            if r.get("video"):
+                r["premiere"] = premiere.build(plan, s.get("sound") or {}, fs, {a["path"]: a for a in analyses}, r["video"],
+                                               Path(r["video"]).with_name(Path(r["video"]).stem + " - Premiere.xml"),
+                                               r.get("width") or 1080, r.get("height") or 1920, int(fs.get("fps", 25)))
+        except Exception as e:
+            log(f"[{job.id}] Premiere export failed: {e}")
+        update_speed("render", (time.time() - t0) * 0.75 / dur)
+        update_speed("finish", (time.time() - t0) * 0.25 / dur)
+        results.append(r)
+        if r.get("replaced") and not any("damaged part" in n for n in notices):
+            names = sorted({Path(x["was"]).name for x in r["replaced"]})
+            notices.append(f"{len(r['replaced'])} shot{'s' if len(r['replaced']) > 1 else ''} came from a damaged part of "
+                           f"{', '.join(names[:3])}{' and others' if len(names) > 3 else ''} and {'were' if len(r['replaced']) > 1 else 'was'} "
+                           "replaced with the next best moments.")
+    plan["notices"] = notices
+    job.close_stage()
+    job.stage_key = None
+    timing = {"total": round(time.time() - job.started, 1), "steps": job.timings}
+    log(f"[{job.id}] finished in {timing['total']:.0f} s: " + ", ".join(f"{t['step']} {t['seconds']:.0f} s" for t in job.timings))
+    meta = {"settings": {k: v for k, v in s.items() if k not in ("director_picks", "match_look") and not k.startswith("_")}, "plan": plan,
+            "outputs": results, "created": time.strftime("%Y-%m-%d %H:%M"), "user": job.user.get("email"),
+            "media": [{"path": m["path"], "kind": m["kind"]} for m in media_items], "timing": timing}
+    (out_dir / "project.json").write_text(json.dumps(meta, indent=1), "utf-8")
+    job.result = {"folder": str(out_dir), "outputs": results, "plan": plan, "version": out_dir.name, "settings": meta["settings"],
+                  "timing": timing, "media": meta["media"]}
+    # what Render changes needs later without watching anything again: the clips' colour data and the speech
+    try:
+        keep = []
+        for a in analyses:
+            if a.get("kind") not in ("video", "photo"):
+                continue
+            keep.append({"path": a["path"], "kind": a["kind"], "key": a.get("key"), "info": a.get("info") or {}, "log": a.get("log"),
+                         "proxy": a.get("proxy"),
+                         "frames": [{k: f.get(k) for k in ("rgb", "luma", "skin_luma", "focus", "fx", "fy", "span") if k in f}
+                                    for f in (a.get("frames") or [])],
+                         "moments": [{k: m.get(k) for k in ("start", "end", "shake", "face_x", "score") if k in m}
+                                     for m in (a.get("moments") or [])]})
+        (out_dir / "analyses.json").write_text(json.dumps(keep, default=_json_safe), "utf-8")
+        if transcripts:
+            used = {sh["src"] for sh in plan.get("shots", [])}
+            (out_dir / "transcripts.json").write_text(json.dumps({k: v for k, v in transcripts.items() if k in used}, default=_json_safe), "utf-8")
+    except Exception as e:
+        log(f"[{job.id}] couldn't save the data for Render changes: {e}")
+    job.state, job.stage, job.progress = "done", "Done", 1.0
+    job.eta = {"stage_left": 0, "total_left": 0, "elapsed": round(time.time() - job.started)}
+    job.push()
+
+
+def _json_safe(o):
+    try:
+        import numpy as _np
+        if isinstance(o, _np.generic):
+            return o.item()
+        if isinstance(o, _np.ndarray):
+            return o.tolist()
+    except Exception:
+        pass
+    return str(o)
 
 
 def friendly_error(e) -> str:
@@ -1109,6 +1191,107 @@ def waveform(path, points=600):
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(res))
     return res
+
+
+def missing_footage_message(paths):
+    """Plain words for footage that can't be found: usually a drive that isn't plugged in (or got another letter)."""
+    first = paths[0]
+    name, folder = os.path.basename(first), os.path.dirname(first)
+    drive = os.path.splitdrive(first)[0]
+    if drive and not os.path.exists(drive + "\\"):
+        return (f"The {drive} drive isn't connected, so EventCut can't open the footage ({name} and others). "
+                f"Plug in the drive that holds {folder} (it must show as {drive} in File Explorer), then try again.")
+    more = f" and {len(paths) - 1} more" if len(paths) > 1 else ""
+    return (f"EventCut can't find {name}{more} in {folder}. Check the drive is plugged in and the "
+            "files haven't been moved or renamed, then try again.")
+
+
+def run_rerender(job: Job):
+    """Render changes: the edited timeline of a finished video, made into a new version without watching or listening
+    to anything again (no Google AI, no speech-to-text). The same song is kept (cut to the new length by Epidemic Sound
+    only if the length changed), sound effects move to the new cuts (effects already on this PC first), and clips that
+    weren't changed are reused from the version being edited instead of being rendered again."""
+    p = job.payload
+    try:
+        job.state = "running"
+        folder = Path(p["folder"])
+        meta = json.loads((folder / "project.json").read_text("utf-8"))
+        plan = p.get("plan") or {}
+        shots = plan.get("shots") or []
+        if not shots:
+            raise ValueError("The timeline is empty: add at least one clip, then render again.")
+        missing = sorted({sh["src"] for sh in shots if not os.path.isfile(sh["src"])})
+        if missing:
+            raise ValueError(missing_footage_message(missing))
+        if not (folder / "analyses.json").exists():
+            # a video made before 1.9.1: the full route (Google's saved answers are reused, so nothing is charged)
+            log(f"[{job.id}] Render changes: {folder.name} has no saved editing data, making it the long way")
+            job.kind = "generate"
+            job.payload = {"kind": "generate", "media": p.get("media") or meta.get("media") or [], "settings": p.get("ctx_settings") or
+                           dict(meta.get("settings") or {}, **(p.get("settings") or {})), "plan": plan}
+            return run_generate(job)
+        s = dict(meta.get("settings") or {})
+        over = dict(p.get("settings") or {})
+        s.update({k: v for k, v in over.items() if k != "music"})
+        for sh in shots:
+            allow(sh["src"])
+        analyses = json.loads((folder / "analyses.json").read_text("utf-8"))
+        have = {a["path"] for a in analyses}
+        for src in sorted({sh["src"] for sh in shots} - have):  # a clip swapped in from a file the video didn't use before
+            kind = media.classify(Path(src))
+            analyses.append({"path": src, "kind": kind, "info": media.probe(src) if kind == "video" else {}, "frames": [], "moments": []})
+        tj = folder / "transcripts.json"
+        transcripts = json.loads(tj.read_text("utf-8")) if tj.exists() else {}
+        formats = [o["format"] for o in meta.get("outputs") or [] if o.get("format")] or s.get("formats") or ["9:16"]
+        body = sum(float(sh["length"]) for sh in shots)
+        end_card = float(plan.get("end_card") or 0) if s.get("end_card", True) and s.get("ending") != "none" else 0.0
+        total = body + end_card
+        sp = load_speed()
+        job.plan_stages({"music": 8, **{f"render_{f}": total * sp["render"] * 0.5 for f in formats},
+                         **{f"finish_{f}": total * sp["finish"] for f in formats}})
+        notices = job.notices
+        log(f"[{job.id}] Render changes: {len(shots)} clips, {total:.1f} s, from {folder.name}")
+        # the sound: the same song, your fades and start, effects on the new cuts
+        old = s.get("sound") or {}
+        m = dict(old.get("music") or {})
+        m.update({k: v for k, v in (over.get("music") or {}).items() if v is not None})
+        old_total = float(old.get("total") or 0) or (sum(float(x["length"]) for x in (meta.get("plan") or {}).get("shots", [])) + end_card)
+        music = {"path": m.get("path"), "start": float(m.get("start") or 0), "fade_in": m.get("fade_in"), "fade_out": m.get("fade_out"),
+                 "title": m.get("title"), "mood": m.get("mood") or (s.get("music") or {}).get("mood"), "version": m.get("version"),
+                 "source": "epidemic" if m.get("source") == "Epidemic Sound" or m.get("source") == "epidemic" else m.get("source"),
+                 "es_id": m.get("id") or m.get("es_id") or (s.get("music") or {}).get("es_id"), "creator": (s.get("music") or {}).get("creator")}
+        job.set_stage("music", "Fitting the music to your edit")
+        if music.get("es_id") and music.get("source") == "epidemic" and abs(total - old_total) > 0.75 and epidemic.enabled():
+            try:  # the same song, re-edited by Epidemic to the new exact length (one download)
+                title = (music.get("title") or "").split(" by ")[0] or "Track"
+                artist = music.get("creator") or ((music.get("title") or "").split(" by ")[1] if " by " in (music.get("title") or "") else "")
+                music.update(path=epidemic.create_version(music["es_id"], total, title, artist), start=0.0, version=True)
+                log(f"[{job.id}] same song, re-edited by Epidemic to {total:.0f} s")
+            except epidemic.EpidemicError as e:
+                notices.append(f"Epidemic Sound couldn't fit the song to the new length ({str(e).rstrip('.')}), so it fades out at the end instead.")
+        elif abs(total - old_total) > 0.75 and music.get("version") and music.get("path"):
+            notices.append("The song keeps its earlier length and fades out at the end of your edit.")
+        if music.get("path") and not os.path.isfile(music["path"]):
+            music["path"] = None
+            notices.append("The song file is no longer on this PC, so EventCut made matching music instead.")
+        s["music"] = {k: v for k, v in music.items() if v is not None}
+        from . import soundplan
+        s["_epidemic_expected"] = epidemic.enabled()
+        s["sound"] = soundplan.build(plan, s, s["music"], total, np.random.default_rng((int(s.get("seed", 0)) * 7 + 5) % (2 ** 32)), notices)
+        job.update(1.0)
+        plan["body"] = round(body, 3)
+        plan.pop("google", None)
+        plan["notices"] = notices
+        plan["made_from"] = folder.name
+        reuse = {o["format"]: str(Path(o["video"]).parent / "_work" / "shots.json") for o in meta.get("outputs") or [] if o.get("video")}
+        render_outputs(job, plan, s, analyses, transcripts, formats, notices, meta.get("media") or [], max(1.0, total), reuse=reuse)
+        play_sound(True)
+    except InterruptedError:
+        job.state, job.stage = "cancelled", "Cancelled"
+        job.push()
+    except Exception as e:
+        fail_job(job, e)
+        play_sound(False)
 
 
 def run_remix(job: Job):
@@ -1269,7 +1452,7 @@ def _queued(job, target):
 
 
 def _queued_inner(job, target):
-    heavy = job.kind == "generate"
+    heavy = job.kind in ("generate", "rerender")
     if heavy:
         with _QCOND:
             _QUEUE.append(job)
@@ -1303,7 +1486,7 @@ def _queued_inner(job, target):
 def start_job(kind, payload, user):
     job = Job(kind, payload, user)
     JOBS[job.id] = job
-    target = {"generate": run_generate, "remix": run_remix, "recaption": run_recaption, "sort": run_sort}[kind]
+    target = {"generate": run_generate, "rerender": run_rerender, "remix": run_remix, "recaption": run_recaption, "sort": run_sort}[kind]
     threading.Thread(target=_queued, args=(job, target), daemon=True).start()
     return job
 
@@ -1539,14 +1722,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"cameras": out, "hero": cams.get("hero"), "auto_hero": cams.get("auto_hero")})
         if path == "/durations" and method == "POST":
             # how long each source clip is (the editor stops a trim at the end of the clip)
-            out = {}
+            out, missing = {}, []
             for p_ in (self.body().get("paths") or [])[:3000]:
-                if path_allowed(p_) and os.path.isfile(p_):
+                if not os.path.isfile(p_):
+                    missing.append(p_)
+                elif path_allowed(p_):
                     try:
                         out[p_] = 0 if media.classify(Path(p_)) == "photo" else round(float(media.probe(p_).get("duration") or 0), 3)
                     except Exception:
                         out[p_] = None
-            return self.send_json({"durations": out})
+            return self.send_json({"durations": out, "missing": missing,
+                                   "missing_note": missing_footage_message(missing) if missing else ""})
         if path == "/preview-edit" and method == "POST":
             # a quick, small preview of edited clips (before the real render), so they can be played in the editor
             return self.send_json(preview_edit(self.body()))

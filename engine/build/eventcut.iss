@@ -1,6 +1,6 @@
 ; Inno Setup script for EventCut Engine
 #define AppName "EventCut Engine"
-#define AppVersion "1.9.0"
+#define AppVersion "1.9.1"
 [Setup]
 AppId={{6B7E3C1A-4E8F-4B6A-9E61-3C5D7A9B0E11}
 AppName={#AppName}
